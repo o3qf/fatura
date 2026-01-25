@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { initializeApp } from "firebase/app";
 import {
   getFirestore,
   collection,
@@ -17,6 +16,11 @@ import {
   onAuthStateChanged,
   signInWithCustomToken,
 } from "firebase/auth";
+
+import { getAnalytics } from "firebase/analytics";
+import { initializeApp } from "firebase/app";
+
+
 import {
   ShoppingCart,
   Plus,
@@ -40,13 +44,18 @@ import {
   Ban,
 } from "lucide-react";
 
+import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
+
+
+
 const CURRENCY = "₺"; // Turkish Lira
+
+
 
 /* =========================
    Firebase Config
    ========================= */
 // Import the functions you need from the SDKs you need
-import { getAnalytics } from "firebase/analytics";
 // TODO: Add SDKs for Firebase products that you want to use
 // https://firebase.google.com/docs/web/setup#available-libraries
 
@@ -63,9 +72,26 @@ const firebaseConfig = {
 };
 
 // Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
+
+
+
+
+
+// ✅ 1) أول شيء initializeApp
+const firebaseApp = initializeApp(firebaseConfig);
+
+// ✅ 2) بعده استخدمه في كل الخدمات
+const auth = getAuth(firebaseApp);
+const db = getFirestore(firebaseApp);
+const storage = getStorage(firebaseApp);
+
+
+
+// (اختياري) Analytics - فقط بالمتصفح
+let analytics;
+if (typeof window !== "undefined") {
+  analytics = getAnalytics(firebaseApp);
+}
 
 // App ID (مهم لمسارات Firestore)
 const appId =
@@ -142,6 +168,10 @@ ownerPinWrong: "كلمة سر صاحب المطعم خاطئة",
 usernameTaken: "اسم المستخدم مستخدم مسبقًا",
 requiredFields: "يرجى تعبئة كل الحقول",
 markedBy: "تم بواسطة",
+iban: "تحويل إلى IBAN",
+ibanInfoTitle: "معلومات التحويل",
+receiptUploadTitle: "إرفاق إيصال التحويل",
+receiptRequired: "يجب إرفاق صورة الإيصال قبل تقديم الطلب",
 
   },
   en: {
@@ -194,6 +224,10 @@ markedBy: "تم بواسطة",
   outOfStock: "Out of stock",
   available: "Available",
   notesPlaceholder: "Example: no onion / extra sauce...",
+iban: "IBAN Transfer",
+ibanInfoTitle: "Transfer Info",
+receiptUploadTitle: "Upload receipt",
+receiptRequired: "You must upload the receipt image before submitting the order",
 
   },
   tr: {
@@ -246,6 +280,10 @@ markedBy: "تم بواسطة",
   outOfStock: "Stok tükendi",
   available: "Mevcut",
   notesPlaceholder: "Örn: soğansız / ekstra sos...",
+iban: "IBAN Havale",
+ibanInfoTitle: "Havale Bilgileri",
+receiptUploadTitle: "Dekont yükle",
+receiptRequired: "Siparişi göndermeden önce dekont görseli yüklemelisiniz",
 
   },
 };
@@ -299,6 +337,14 @@ const Pill = ({ children, variant = "neutral" }) => {
   );
 };
 
+const normalizeDigits = (s = "") =>
+  String(s)
+    // Arabic-Indic ٠١٢٣٤٥٦٧٨٩
+    .replace(/[٠-٩]/g, (d) => "٠١٢٣٤٥٦٧٨٩".indexOf(d))
+    // Eastern Arabic-Indic ۰۱۲۳۴۵۶۷۸۹
+    .replace(/[۰-۹]/g, (d) => "۰۱۲۳۴۵۶۷۸۹".indexOf(d));
+
+
 export default function App() {
   /* =========================
      Router (بدون مكتبة)
@@ -320,6 +366,46 @@ const [adminUsername, setAdminUsername] = useState("");
 const [adminPassword, setAdminPassword] = useState("");
 const [ownerPin, setOwnerPin] = useState("");
 const [adminAuthError, setAdminAuthError] = useState("");
+const [ownerConfig, setOwnerConfig] = useState(null); // { ownerUsername, ownerPassword }
+const [isOwner, setIsOwner] = useState(false);
+
+// لإدارة حسابات الموظفين (Owner فقط)
+const [accountsOpen, setAccountsOpen] = useState(false);
+const [adminUsers, setAdminUsers] = useState([]);
+
+const [accEdit, setAccEdit] = useState(null);
+const [accUsername, setAccUsername] = useState("");
+const [accPassword, setAccPassword] = useState("");
+
+const [newOwnerPass, setNewOwnerPass] = useState("");
+const [newOwnerUser, setNewOwnerUser] = useState("");
+
+
+const updateOwnerCredentials = async () => {
+  if (adminSession?.role !== "owner") return;
+
+  const nu = normalizeDigits(newOwnerUser).trim().toLowerCase();
+  const np = normalizeDigits(newOwnerPass).trim();
+  if (!nu || !np) return;
+
+  await updateDoc(doc(db, ...ownerDocPath), {
+    ownerUsername: nu,
+    ownerPassword: np,
+    updatedAt: Date.now(),
+  });
+
+  const session = { username: nu, role: "owner" };
+  setAdminSession(session);
+  setIsOwner(true);
+  localStorage.setItem("wingi_admin_session", JSON.stringify(session));
+
+  setNewOwnerUser("");
+  setNewOwnerPass("");
+};
+
+
+
+
 
 // 5B: restore admin session
 useEffect(() => {
@@ -328,10 +414,14 @@ useEffect(() => {
   const raw = localStorage.getItem("wingi_admin_session");
   if (raw) {
     try {
-      setAdminSession(JSON.parse(raw));
+      const s = JSON.parse(raw);
+      setAdminSession(s);
+      setIsOwner(s?.role === "owner");
     } catch {}
   }
 }, []);
+
+
 
 
 useEffect(() => {
@@ -367,6 +457,12 @@ useEffect(() => {
   const [isCartOpen, setIsCartOpen] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState(null);
   const [orderStatus, setOrderStatus] = useState(null);
+  const [receiptDataUrl, setReceiptDataUrl] = useState("");
+const [receiptError, setReceiptError] = useState("");
+const [receiptOpen, setReceiptOpen] = useState(false);
+const [receiptView, setReceiptView] = useState("");
+
+
 
   // Notes modal (customer)
 const [notesOpen, setNotesOpen] = useState(false);
@@ -377,6 +473,20 @@ const [notesText, setNotesText] = useState("");
   const [editingItem, setEditingItem] = useState(null);
   const [activeCategory, setActiveCategory] = useState("All");
   const [isTranslating, setIsTranslating] = useState(false);
+
+  // ===== Admin create order =====
+const [createOrderOpen, setCreateOrderOpen] = useState(false);
+const [orderTable, setOrderTable] = useState("");
+const [orderPay, setOrderPay] = useState("cash");
+const [orderItems, setOrderItems] = useState([]);
+const [createOrderError, setCreateOrderError] = useState("");
+const [orderDiscount, setOrderDiscount] = useState(0); // نسبة الخصم %
+const [uploadingImage, setUploadingImage] = useState(false);
+const [imageUploadError, setImageUploadError] = useState("");
+
+
+
+
 
   const t = translations[lang];
   const admT = translations[adminLang];
@@ -431,6 +541,95 @@ const [notesText, setNotesText] = useState("");
       unsubOrders();
     };
   }, [user]);
+
+  const uploadMenuImage = async (file) => {
+  setImageUploadError("");
+
+  if (!file) return "";
+  if (!file.type.startsWith("image/")) {
+    setImageUploadError("الملف لازم يكون صورة");
+    return "";
+  }
+
+  try {
+    setUploadingImage(true);
+
+    const safeName = `${Date.now()}_${file.name}`.replace(/\s+/g, "_");
+    const path = `menuImages/${appId}/${safeName}`;
+    const r = storageRef(storage, path);
+
+    await uploadBytes(r, file);
+    const url = await getDownloadURL(r);
+
+    return url;
+  } catch (e) {
+    console.error(e);
+    setImageUploadError("فشل رفع الصورة");
+    return "";
+  } finally {
+    setUploadingImage(false);
+  }
+};
+
+  // (A) إنشاء/تصحيح owner إذا ناقص
+useEffect(() => {
+  if (!user) return;
+
+  const ensureOwner = async () => {
+    const ref = doc(db, ...ownerDocPath);
+    const snap = await getDoc(ref);
+
+    // إذا الوثيقة غير موجودة -> أنشئها
+    if (!snap.exists()) {
+      await setDoc(ref, {
+        ownerUsername: "admin",
+        ownerPassword: "12344321",
+        updatedAt: Date.now(),
+      });
+      return;
+    }
+
+    // إذا موجودة لكن ناقصة (مثل ownerPassword undefined) -> أصلحها
+    const data = snap.data() || {};
+    if (!data.ownerUsername || !data.ownerPassword) {
+      await setDoc(
+        ref,
+        {
+          ownerUsername: data.ownerUsername || "admin",
+          ownerPassword: data.ownerPassword || "12344321",
+          updatedAt: Date.now(),
+        },
+        { merge: true }
+      );
+    }
+  };
+
+  ensureOwner();
+}, [user]);
+
+
+// (B) جلب ownerConfig realtime
+useEffect(() => {
+  if (!user) return;
+
+  const unsub = onSnapshot(doc(db, ...ownerDocPath), (snap) => {
+    if (snap.exists()) setOwnerConfig(snap.data());
+  });
+
+  return () => unsub();
+}, [user]);
+
+// (C) جلب حسابات الموظفين realtime (لـ owner فقط)
+useEffect(() => {
+  if (!user) return;
+  if (!adminSession || adminSession.role !== "owner") return;
+
+  const unsub = onSnapshot(collection(db, ...adminUsersColPath), (snap) => {
+    setAdminUsers(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+  });
+
+  return () => unsub();
+}, [user, adminSession]);
 
   /* =========================
      Localization helpers
@@ -517,6 +716,163 @@ const [notesText, setNotesText] = useState("");
 
 
 
+// ===== Admin create order helpers =====
+const addAdminOrderItem = (menuItem) => {
+  setOrderItems((prev) => {
+    const exist = prev.find((x) => x.id === menuItem.id);
+    if (exist) {
+      return prev.map((x) =>
+        x.id === menuItem.id
+          ? { ...x, quantity: x.quantity + 1 }
+          : x
+      );
+    }
+    return [...prev, { id: menuItem.id, quantity: 1, note: "" }];
+  });
+};
+
+const changeAdminOrderQty = (id, delta) => {
+  setOrderItems((prev) =>
+    prev.map((x) =>
+      x.id === id
+        ? { ...x, quantity: Math.max(1, x.quantity + delta) }
+        : x
+    )
+  );
+};
+
+const removeAdminOrderItem = (id) => {
+  setOrderItems((prev) => prev.filter((x) => x.id !== id));
+};
+
+const submitAdminOrder = async () => {
+  setCreateOrderError("");
+
+  // ✅ الاسم (بدل المستلم/رقم الطاولة)
+  if (!String(orderTable).trim()) {
+    setCreateOrderError("اكتب الاسم");
+    return;
+  }
+
+  if (orderItems.length === 0) {
+    setCreateOrderError("اختر منتجات من المنيو");
+    return;
+  }
+
+
+  // ✅ جهز العناصر بصيغة الفاتورة + الملاحظات
+  const items = (orderItems || []).map((it) => ({
+    ...it,
+    quantity: it.quantity || 1,
+    note: it.note || "",
+    _key: `${it.id}__${it.note || ""}`,
+  }));
+
+  const subtotal = items.reduce(
+  (s, it) => s + (Number(it.price || 0) * Number(it.quantity || 1)),
+  0
+);
+
+const discountPercent = Math.min(100, Math.max(0, Number(orderDiscount || 0)));
+const discountAmount = (subtotal * discountPercent) / 100;
+const total = Math.max(0, subtotal - discountAmount);
+
+
+  await addDoc(collection(db, "artifacts", appId, "public", "data", "orders"), {
+  table: orderTable,
+  items,
+
+  subtotal,
+  discountPercent,
+  discountAmount,
+  total,
+
+  paymentMethod: orderPay,
+  status: "new",
+  timestamp: Date.now(),
+});
+
+
+
+  setCreateOrderOpen(false);
+  setOrderTable("");
+  setOrderPay("cash");
+  setOrderItems([]);
+  setCreateOrderError("");
+  setReceiptDataUrl("");
+setReceiptError("");
+setOrderDiscount(0);
+
+
+};
+
+
+
+const printInvoice = (order) => {
+  const shopName = "Wingi";
+
+  const paymentLabel =
+  order.paymentMethod === "cash"
+    ? "Cash"
+    : order.paymentMethod === "card"
+    ? "Card"
+    : "Transfer (IBAN)";
+
+
+  const itemsHtml = (order.items || [])
+    .map(
+      (it) => `
+      <tr>
+        <td>${it.quantity}x ${it.nameAr || it.name}</td>
+        <td style="text-align:right;">
+          ${(it.price * it.quantity).toFixed(2)} TL
+        </td>
+      </tr>
+      ${
+        it.note
+          ? `<tr><td colspan="2">📝 ${it.note}</td></tr>`
+          : ""
+      }
+    `
+    )
+    .join("");
+
+  const html = `
+  <html>
+    <head>
+      <style>
+        body { font-family: Arial; width:300px }
+        h2 { text-align:center }
+        table { width:100% }
+        hr { border:1px dashed #000 }
+      </style>
+    </head>
+    <body>
+      <h2>${shopName}</h2>
+      <hr />
+      <p>Table: ${order.table}</p>
+      <p>Payment: ${paymentLabel}</p>
+      <hr />
+      <table>${itemsHtml}</table>
+      <hr />
+      <h3>Total: ${order.total} TL</h3>
+
+      <script>
+        window.onload = function () {
+          window.print();
+          setTimeout(() => window.close(), 300);
+        };
+      </script>
+    </body>
+  </html>
+  `;
+
+  const w = window.open("", "_blank", "width=400,height=600");
+  w.document.write(html);
+  w.document.close();
+};
+
+
   /* =========================
      AI Translate (Optional)
      ========================= */
@@ -570,53 +926,163 @@ Return JSON only:
 // Admin Auth helpers (MUST be before any route returns)
 // =========================
 const adminUsersColPath = ["artifacts", appId, "public", "data", "adminUsers"];
+const ownerDocPath = ["artifacts", appId, "public", "data", "adminConfig", "owner"];
+
 
 const adminLogin = async () => {
   setAdminAuthError("");
+  setIsOwner(false);
+
   if (!adminUsername || !adminPassword) {
     setAdminAuthError(admT.requiredFields);
     return;
   }
 
   try {
-    const ref = doc(db, ...adminUsersColPath, adminUsername);
-    const snap = await getDoc(ref);
+    const u = normalizeDigits(adminUsername).trim().toLowerCase();
+    const p = normalizeDigits(adminPassword).trim();
 
+    // اقرأ بيانات المالك
+    const ref = doc(db, ...ownerDocPath);
+    let snap = await getDoc(ref);
+
+    // لو ما موجودة أنشئها افتراضي
     if (!snap.exists()) {
-      setAdminAuthError(admT.invalidCredentials);
-      return;
+      await setDoc(ref, {
+        ownerUsername: "admin",
+        ownerPassword: "12344321",
+        updatedAt: Date.now(),
+      });
+      snap = await getDoc(ref);
     }
 
-    const data = snap.data();
-    if (data.password !== adminPassword) {
-      setAdminAuthError(admT.invalidCredentials);
-      return;
-    }
+    const owner = snap.data() || {};
+    const ownerU = normalizeDigits(owner.ownerUsername || "admin").trim().toLowerCase();
+    const ownerP = normalizeDigits(owner.ownerPassword || "12344321").trim();
 
-    const session = { username: adminUsername };
-    setAdminSession(session);
-    if (typeof window !== "undefined") {
+    // ✅ Owner login
+    if (u === ownerU) {
+      if (p !== ownerP) {
+        setAdminAuthError(admT.invalidCredentials);
+        return;
+      }
+
+      const session = { username: ownerU, role: "owner" };
+      setAdminSession(session);
+      setIsOwner(true);
       localStorage.setItem("wingi_admin_session", JSON.stringify(session));
+      return;
     }
+
+    // ✅ Staff login
+    const staffRef = doc(db, ...adminUsersColPath, u);
+    const staffSnap = await getDoc(staffRef);
+    if (!staffSnap.exists()) {
+      setAdminAuthError(admT.invalidCredentials);
+      return;
+    }
+
+    const data = staffSnap.data();
+    const staffPass = normalizeDigits(data.password || "").trim();
+    if (p !== staffPass) {
+      setAdminAuthError(admT.invalidCredentials);
+      return;
+    }
+
+    const session = { username: u, role: "staff" };
+    setAdminSession(session);
+    setIsOwner(false);
+    localStorage.setItem("wingi_admin_session", JSON.stringify(session));
   } catch (e) {
     console.error(e);
     setAdminAuthError("Error");
   }
 };
 
+
+
+const adminLogout = () => {
+  setAdminSession(null);
+  if (typeof window !== "undefined") {
+    localStorage.removeItem("wingi_admin_session");
+  }
+};
+
+const upsertAdminUser = async () => {
+  if (adminSession?.role !== "owner") return;
+  if (!accUsername || !accPassword) return;
+
+  // امنع إنشاء حساب باسم admin
+  if (accUsername === (ownerConfig?.ownerUsername || "admin")) return;
+
+  const ref = doc(db, ...adminUsersColPath, accUsername);
+
+  await setDoc(
+    ref,
+    {
+      username: accUsername,
+      password: accPassword,
+      createdAt: accEdit?.createdAt || Date.now(),
+      updatedAt: Date.now(),
+    },
+    { merge: true }
+  );
+
+  setAccEdit(null);
+  setAccUsername("");
+  setAccPassword("");
+};
+
+const deleteAdminUser = async (u) => {
+  if (adminSession?.role !== "owner") return;
+  await deleteDoc(doc(db, ...adminUsersColPath, u.username));
+};
+
+const updateOwnerPassword = async () => {
+  if (adminSession?.role !== "owner") return;
+  if (!newOwnerPass) return;
+
+  await updateDoc(doc(db, ...ownerDocPath), {
+    ownerPassword: newOwnerPass,
+    updatedAt: Date.now(),
+  });
+
+  setNewOwnerPass("");
+};
+
+
 const adminRegister = async () => {
   setAdminAuthError("");
+
   if (!adminUsername || !adminPassword || !ownerPin) {
     setAdminAuthError(admT.requiredFields);
     return;
   }
 
-  if (ownerPin !== "12344321") {
+  const pin = normalizeDigits(ownerPin).trim();
+
+  // 🔐 PIN = كلمة مرور صاحب المطعم الحالية
+  const currentPin = normalizeDigits(ownerConfig?.ownerPassword || "").trim();
+
+
+  if (!currentPin) {
+    setAdminAuthError("Owner config not loaded");
+    return;
+  }
+
+  if (pin !== currentPin) {
+
     setAdminAuthError(admT.ownerPinWrong);
     return;
   }
 
   try {
+    // ممنوع إنشاء حساب باسم admin
+    if (adminUsername === (ownerConfig?.ownerUsername || "admin")) {
+      setAdminAuthError("This username is reserved");
+      return;
+    }
+
     const ref = doc(db, ...adminUsersColPath, adminUsername);
     const snap = await getDoc(ref);
 
@@ -631,23 +1097,16 @@ const adminRegister = async () => {
       createdAt: Date.now(),
     });
 
-    const session = { username: adminUsername };
+    const session = { username: adminUsername, role: "staff" };
     setAdminSession(session);
-    if (typeof window !== "undefined") {
-      localStorage.setItem("wingi_admin_session", JSON.stringify(session));
-    }
+    localStorage.setItem("wingi_admin_session", JSON.stringify(session));
   } catch (e) {
     console.error(e);
     setAdminAuthError("Error");
   }
 };
 
-const adminLogout = () => {
-  setAdminSession(null);
-  if (typeof window !== "undefined") {
-    localStorage.removeItem("wingi_admin_session");
-  }
-};
+
 
   /* ==========================================================
      1) ADMIN ROUTE: /admin  -> يظهر Portal + Admin
@@ -742,6 +1201,7 @@ const adminLogout = () => {
                 className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
               />
 
+
               {adminAuthMode === "register" && (
                 <input
                   value={ownerPin}
@@ -764,6 +1224,8 @@ const adminLogout = () => {
               >
                 {adminAuthMode === "login" ? admT.login : admT.createAccount}
               </button>
+
+
 
               <button
                 onClick={() => {
@@ -825,6 +1287,22 @@ const adminLogout = () => {
           {admT.goPortal}
         </button>
 
+{adminSession?.role === "owner" && (
+  <button
+    onClick={() => setAccountsOpen(true)}
+    className="bg-slate-950 text-white px-5 py-2 rounded-xl font-black hover:bg-black transition-all"
+  >
+    Manage Accounts
+  </button>
+)}
+
+<button
+  onClick={() => setCreateOrderOpen(true)}
+  className="bg-orange-600 text-white px-5 py-2 rounded-xl font-black hover:bg-orange-500 transition-all"
+>
+  + إضافة طلب جديد
+</button>
+
         <button
           onClick={adminLogout}
           className="bg-slate-100 text-slate-600 px-5 py-2 rounded-xl font-black hover:bg-slate-200 transition-all"
@@ -841,12 +1319,12 @@ const adminLogout = () => {
           <div className="xl:col-span-8 space-y-8">
             {/* Active */}
             <div className="flex items-center justify-between">
-              <h2 className="text-xl font-black flex items-center gap-3">
-                {admT.activeOrders}
-                <span className="bg-orange-500 text-white text-xs px-3 py-1 rounded-full">
-                  {activeOrders.length}
-                </span>
-              </h2>
+              <div className="flex items-center justify-between">
+  <h2 className="text-xl font-black">
+    {admT.activeOrders}
+  </h2>
+</div>
+
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -858,7 +1336,7 @@ const adminLogout = () => {
                   <div className="flex justify-between items-start mb-6">
                     <div>
                       <span className="bg-slate-950 text-white px-5 py-2 rounded-2xl font-black text-xl">
-                        {admT.table} {order.table}
+              رقم الطاولة : {order.table}
                       </span>
                       <div className="mt-2 text-xs text-slate-400 font-bold flex items-center gap-2">
                         <Clock size={14} />
@@ -867,19 +1345,58 @@ const adminLogout = () => {
                     </div>
 
                     <div
-                      className={`px-4 py-2 rounded-2xl font-black flex items-center gap-2 ${
-                        order.paymentMethod === "cash"
-                          ? "bg-emerald-100 text-emerald-700"
-                          : "bg-blue-100 text-blue-700"
-                      }`}
-                    >
-                      {order.paymentMethod === "cash" ? (
-                        <Banknote size={18} />
-                      ) : (
-                        <CreditCard size={18} />
-                      )}
-                      {order.paymentMethod === "cash" ? admT.cash : admT.card}
-                    </div>
+  className={`px-4 py-2 rounded-2xl font-black flex items-center gap-2 ${
+    order.paymentMethod === "cash"
+      ? "bg-emerald-100 text-emerald-700"
+      : order.paymentMethod === "card"
+      ? "bg-blue-100 text-blue-700"
+      : "bg-orange-100 text-orange-700"
+  }`}
+>
+  {order.paymentMethod === "cash" ? (
+    <Banknote size={18} />
+  ) : order.paymentMethod === "card" ? (
+    <CreditCard size={18} />
+  ) : (
+    <Banknote size={18} />
+  )}
+
+  {order.paymentMethod === "cash"
+    ? admT.cash
+    : order.paymentMethod === "card"
+    ? admT.card
+    : admT.iban}
+</div>
+
+{order.paymentMethod === "iban" && (
+  <div className="mt-3 bg-slate-50 p-3 rounded-2xl">
+    <div className="text-xs font-black text-slate-700 mb-2">
+      {admT.ibanInfoTitle}: wingi — {order.ibanNumber || "TR00000000000000000000000000000000000"}
+    </div>
+
+    {order.receiptDataUrl ? (
+      
+      <button
+  type="button"
+  onClick={() => {
+    setReceiptView(order.receiptDataUrl);
+    setReceiptOpen(true);
+  }}
+  className="text-sm font-black text-orange-600 underline"
+>
+  عرض صورة الإيصال
+</button>
+
+
+    ) : (
+      <div className="text-xs font-black text-red-600">
+        لا يوجد إيصال مرفق
+      </div>
+    )}
+  </div>
+)}
+
+
                   </div>
 
                   <div className="space-y-3 mb-6 bg-slate-50 p-4 rounded-2xl">
@@ -911,19 +1428,28 @@ const adminLogout = () => {
                     </span>
 
                     <div className="flex gap-2">
-                      <button
-                        onClick={() => markOrder(order.id, "prepared")}
-                        className="bg-emerald-600 text-white px-5 py-3 rounded-2xl font-black hover:bg-emerald-700 transition-all flex items-center gap-2"
-                      >
-                        <Check size={18} /> {admT.markPrepared}
-                      </button>
-                      <button
-                        onClick={() => markOrder(order.id, "cancelled")}
-                        className="bg-red-600 text-white px-5 py-3 rounded-2xl font-black hover:bg-red-700 transition-all flex items-center gap-2"
-                      >
-                        <Ban size={18} /> {admT.markCancel}
-                      </button>
-                    </div>
+  <button
+    onClick={() => printInvoice(order)}
+    className="bg-slate-950 text-white px-4 py-2 rounded-xl font-black"
+  >
+    🖨 طباعة فاتورة
+  </button>
+
+  <button
+    onClick={() => markOrder(order.id, "prepared")}
+    className="bg-emerald-600 text-white px-4 py-2 rounded-xl font-black"
+  >
+    تم التحضير
+  </button>
+
+  <button
+    onClick={() => markOrder(order.id, "cancelled")}
+    className="bg-red-600 text-white px-4 py-2 rounded-xl font-black"
+  >
+    إلغاء
+  </button>
+</div>
+
                   </div>
                 </div>
               ))}
@@ -987,24 +1513,34 @@ const adminLogout = () => {
                         )}
                       </div>
 
-                      <div className="flex justify-between items-center">
-                        <span className="text-2xl font-black text-slate-900">
-                          {order.total} <small className="text-sm font-bold">TL</small>
-                        </span>
+                      <div className="flex justify-between items-center gap-2">
+  <span className="text-2xl font-black text-slate-900">
+    {order.total} <small className="text-sm font-bold">TL</small>
+  </span>
 
-                        {/* optional: delete old record */}
-                        <button
-                          onClick={() =>
-                            deleteDoc(
-                              doc(db, "artifacts", appId, "public", "data", "orders", order.id)
-                            )
-                          }
-                          className="px-4 py-2 rounded-xl bg-slate-100 text-slate-500 font-black hover:bg-red-50 hover:text-red-600 transition-all"
-                          title="Delete"
-                        >
-                          <Trash2 size={16} />
-                        </button>
-                      </div>
+  <div className="flex gap-2">
+    <button
+      onClick={() => printInvoice(order)}
+      className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black hover:bg-black transition-all"
+    >
+      🖨 طباعة فاتورة
+    </button>
+
+    <button
+      onClick={() =>
+        deleteDoc(
+          doc(db, "artifacts", appId, "public", "data", "orders", order.id)
+        )
+      }
+      className="px-4 py-2 rounded-xl bg-slate-100 text-slate-500 font-black hover:bg-red-50 hover:text-red-600 transition-all"
+      title="Delete"
+    >
+      <Trash2 size={16} />
+    </button>
+  </div>
+</div>
+
+
                     </div>
                   );
                 })}
@@ -1068,6 +1604,200 @@ const adminLogout = () => {
             </div>
           </div>
         </main>
+
+        
+{receiptOpen && (
+  <div className="fixed inset-0 z-[999] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div className="w-full max-w-3xl bg-white rounded-[2.5rem] p-6">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-xl font-black text-slate-900">صورة الإيصال</h3>
+
+        <button
+          type="button"
+          onClick={() => {
+            setReceiptOpen(false);
+            setReceiptView("");
+          }}
+          className="p-2 bg-slate-50 rounded-2xl text-slate-400"
+        >
+          <X size={18} />
+        </button>
+      </div>
+
+      <img
+        src={receiptView}
+        alt="receipt"
+        className="w-full max-h-[75vh] object-contain rounded-2xl border"
+      />
+    </div>
+  </div>
+)}
+
+
+{createOrderOpen && (
+  <div className="fixed inset-0 z-[250] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div className="w-full max-w-5xl bg-white rounded-[2.5rem] p-6 max-h-[90vh] overflow-y-auto">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-2xl font-black text-slate-900">إضافة طلب جديد</h3>
+        <button
+          onClick={() => setCreateOrderOpen(false)}
+          className="p-2 bg-slate-50 rounded-2xl text-slate-400"
+        >
+          <X size={18} />
+        </button>
+      </div>
+
+      {/* بيانات الطلب */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+       
+       <input
+  type="number"
+  min="0"
+  max="100"
+  value={orderDiscount}
+  onChange={(e) => setOrderDiscount(Number(e.target.value || 0))}
+  placeholder="خصم %"
+  className="p-3 rounded-xl border"
+/>
+
+        <input
+          value={orderTable}
+          onChange={(e) => setOrderTable(e.target.value)}
+          placeholder= "اسم المستلم"
+          className="p-3 rounded-xl border"
+        />
+        <select
+          value={orderPay}
+          onChange={(e) => setOrderPay(e.target.value)}
+          className="p-3 rounded-xl border"
+        >
+          <option value="cash">كاش</option>
+          <option value="card">بطاقة</option>
+        </select>
+      </div>
+
+      {/* المنيو */}
+      <div className="mb-6">
+        <div className="font-black text-slate-900 mb-2">اختر المنتجات من المنيو</div>
+
+        {menuItems.length === 0 ? (
+          <div className="p-4 rounded-xl bg-slate-50 text-slate-500 font-bold">
+            المنيو فاضي أو ما زال يحمل… تأكد أنك أضفت منتجات في المنيو أولاً.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {menuItems.map((m) => {
+              const selected = orderItems.find((x) => x.id === m.id);
+              return (
+                <div
+                  key={m.id}
+                  className="p-4 rounded-2xl border flex items-center justify-between"
+                >
+                  <div className="flex items-center gap-3">
+                    {m.image ? (
+                      <img
+                        src={m.image}
+                        alt=""
+                        className="w-12 h-12 rounded-xl object-cover bg-slate-100"
+                        onError={(e) => (e.currentTarget.style.display = "none")}
+                      />
+                    ) : (
+                      <div className="w-12 h-12 rounded-xl bg-slate-100" />
+                    )}
+                    <div>
+                      <div className="font-black text-slate-900">
+                        {getLocalizedValue(m, "name", adminLang)}
+                      </div>
+                      <div className="text-xs text-slate-500 font-bold">
+                        {m.price} TL
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => {
+                        setOrderItems((prev) => {
+                          const ex = prev.find((x) => x.id === m.id);
+                          if (ex) {
+                            return prev.map((x) =>
+                              x.id === m.id ? { ...x, quantity: (x.quantity || 1) + 1 } : x
+                            );
+                          }
+                          return [...prev, { ...m, quantity: 1 }];
+                        });
+                      }}
+                      className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
+                    >
+                      +
+                    </button>
+
+                    <div className="w-8 text-center font-black text-slate-900">
+                      {selected?.quantity || 0}
+                    </div>
+
+                    <button
+                      onClick={() => {
+                        setOrderItems((prev) => {
+                          const ex = prev.find((x) => x.id === m.id);
+                          if (!ex) return prev;
+                          if ((ex.quantity || 1) <= 1) return prev.filter((x) => x.id !== m.id);
+                          return prev.map((x) =>
+                            x.id === m.id ? { ...x, quantity: (x.quantity || 1) - 1 } : x
+                          );
+                        });
+                      }}
+                      className="px-4 py-2 rounded-xl bg-slate-100 text-slate-800 font-black"
+                    >
+                      -
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* خطأ */}
+      {createOrderError && (
+        <div className="mt-4 p-3 rounded-xl bg-red-100 text-red-700 font-bold">
+          {createOrderError}
+        </div>
+      )}
+
+      {/* أزرار */}
+      <div className="flex justify-between items-center mt-6 gap-3">
+        <button
+          onClick={() => {
+            setCreateOrderOpen(false);
+            setOrderTable("");
+setOrderPay("cash");
+setOrderItems([]);
+setCreateOrderError("");
+          }}
+          className="px-6 py-3 rounded-xl bg-slate-100 text-slate-700 font-black"
+        >
+          إلغاء
+        </button>
+
+        <button
+  type="button"
+  onClick={submitAdminOrder}
+  disabled={
+  !String(orderTable).trim() ||
+  orderItems.length === 0
+}
+  className="px-6 py-3 bg-orange-600 text-white rounded-xl font-black disabled:opacity-40"
+>
+  حفظ الطلب
+</button>
+
+      </div>
+    </div>
+  </div>
+)}
+
 
         {/* Edit Modal */}
         {editingItem && (
@@ -1174,12 +1904,75 @@ const adminLogout = () => {
                   placeholder={admT.price}
                   className="p-4 rounded-2xl border font-black"
                 />
-                <input
-                  value={editingItem.image || ""}
-                  onChange={(e) => setEditingItem({ ...editingItem, image: e.target.value })}
-                  placeholder={admT.image}
-                  className="p-4 rounded-2xl border"
-                />
+
+                {/* السعر القديم */}
+<input
+  type="number"
+  placeholder="السعر قبل العرض"
+  value={editingItem.oldPrice ?? ""}
+  onChange={(e) =>
+    setEditingItem({ ...editingItem, oldPrice: parseFloat(e.target.value || "0") })
+  }
+  className="p-4 rounded-2xl border"
+/>
+
+{/* تفعيل العرض */}
+<div className="flex items-center justify-between bg-slate-50 p-4 rounded-2xl">
+  <span className="font-black text-slate-800">تفعيل العرض</span>
+  <input
+    type="checkbox"
+    checked={!!editingItem.isOffer}
+    onChange={(e) =>
+      setEditingItem({ ...editingItem, isOffer: e.target.checked })
+    }
+    className="w-6 h-6"
+  />
+</div>
+
+                {/* رابط الصورة */}
+<input
+  value={editingItem.image || ""}
+  onChange={(e) => setEditingItem({ ...editingItem, image: e.target.value })}
+  placeholder="رابط الصورة (اختياري)"
+  className="p-4 rounded-2xl border"
+/>
+
+{/* رفع صورة من الجهاز */}
+<div className="p-4 rounded-2xl border bg-slate-50 space-y-3">
+  <div className="font-black text-slate-800">أو ارفع صورة من جهازك</div>
+
+  <input
+    type="file"
+    accept="image/*"
+    onChange={async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      const url = await uploadMenuImage(file);
+      if (url) {
+        setEditingItem((prev) => ({ ...prev, image: url })); // ✅ نخزن رابط الصورة النهائي
+      }
+    }}
+    className="block w-full text-sm"
+  />
+
+  {uploadingImage && (
+    <div className="text-xs font-black text-slate-500">جاري رفع الصورة...</div>
+  )}
+
+  {imageUploadError && (
+    <div className="text-xs font-black text-red-600">{imageUploadError}</div>
+  )}
+
+  {editingItem.image && (
+    <img
+      src={editingItem.image}
+      alt="preview"
+      className="w-full h-40 object-cover rounded-2xl border"
+    />
+  )}
+</div>
+
               </div>
               <div className="mt-4 flex items-center justify-between bg-slate-50 p-4 rounded-2xl">
   <div className="font-black text-slate-800">{admT.outOfStock}</div>
@@ -1224,6 +2017,214 @@ const adminLogout = () => {
             </div>
           </div>
         )}
+
+{accountsOpen && adminSession?.role === "owner" && (
+  <div className="fixed inset-0 z-[200] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div className="w-full max-w-4xl bg-white rounded-[2.5rem] p-6">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-2xl font-black text-slate-900">Manage Accounts</h3>
+        <button
+          onClick={() => setAccountsOpen(false)}
+          className="p-2 bg-slate-50 rounded-2xl text-slate-400"
+        >
+          <X size={18} />
+        </button>
+      </div>
+
+      {/* تغيير كلمة مرور المالك (تصير PIN) */}
+      <div className="bg-slate-50 p-4 rounded-2xl mb-6">
+  <div className="font-black text-slate-800 mb-2">Owner credentials</div>
+
+  <div className="grid grid-cols-2 gap-3">
+    <input
+      value={newOwnerUser}
+      onChange={(e) => setNewOwnerUser(e.target.value)}
+      placeholder="New owner username"
+      className="p-3 rounded-xl border"
+    />
+    <input
+      value={newOwnerPass}
+      onChange={(e) => setNewOwnerPass(e.target.value)}
+      type="password"
+      placeholder="New owner password (PIN)"
+      className="p-3 rounded-xl border"
+    />
+    <button
+      onClick={updateOwnerCredentials}
+      className="col-span-2 px-5 py-3 rounded-xl bg-slate-950 text-white font-black"
+    >
+      Save Owner Changes
+    </button>
+  </div>
+
+  <div className="mt-2 text-xs text-slate-500 font-bold">
+    PIN لإنشاء حسابات جديدة = كلمة مرور المالك الحالية
+  </div>
+</div>
+
+
+      {/* إضافة/تعديل حساب موظف */}
+      <div className="grid grid-cols-2 gap-4 mb-6">
+        <input
+          value={accUsername}
+          onChange={(e) => setAccUsername(e.target.value)}
+          placeholder="Username"
+          className="p-3 rounded-xl border"
+        />
+        <input
+          value={accPassword}
+          onChange={(e) => setAccPassword(e.target.value)}
+          placeholder="Password"
+          type="password"
+          className="p-3 rounded-xl border"
+        />
+        <button
+          onClick={upsertAdminUser}
+          className="col-span-2 py-3 rounded-xl bg-orange-600 text-white font-black"
+        >
+          {accEdit ? "Update User" : "Add User"}
+        </button>
+      </div>
+
+      {/* قائمة الحسابات */}
+      <div className="space-y-3 max-h-[45vh] overflow-y-auto">
+        {adminUsers.length === 0 ? (
+          <div className="text-slate-400 font-bold">No users yet</div>
+        ) : (
+          adminUsers.map((u) => (
+            <div
+              key={u.username}
+              className="p-4 rounded-2xl border flex items-center justify-between"
+            >
+              <div>
+                <div className="font-black text-slate-900">{u.username}</div>
+                <div className="text-xs text-slate-400 font-bold">
+                  updated: {u.updatedAt ? new Date(u.updatedAt).toLocaleString() : "-"}
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  onClick={() => {
+                    setAccEdit(u);
+                    setAccUsername(u.username);
+                    setAccPassword(u.password || "");
+                  }}
+                  className="px-4 py-2 rounded-xl bg-slate-100 text-slate-700 font-black"
+                >
+                  Edit
+                </button>
+                <button
+                  onClick={() => deleteAdminUser(u)}
+                  className="px-4 py-2 rounded-xl bg-red-100 text-red-700 font-black"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  </div>
+)}
+
+{createOrderOpen && (
+  <div
+  className="bg-white w-full max-w-4xl rounded-3xl p-6 max-h-[90vh] overflow-y-auto"
+  onClick={(e) => e.stopPropagation()}
+>
+    <div className="bg-white w-full max-w-4xl rounded-3xl p-6 max-h-[90vh] overflow-y-auto">
+      <h2 className="text-2xl font-black mb-4">إضافة طلب جديد</h2>
+
+      <div className="grid grid-cols-3 gap-3 mb-4">
+        <input
+          placeholder="مستلم الطلب"
+          className="border p-3 rounded-xl"
+        />
+        <input
+  value={orderTable}
+  onChange={(e) => setOrderTable(e.target.value)}
+  placeholder="رقم الطاولة :"
+  className="p-3 rounded-xl border"
+/>
+        <select
+          value={orderPay}
+          onChange={(e) => setOrderPay(e.target.value)}
+          className="border p-3 rounded-xl"
+        >
+          <option value="cash">كاش</option>
+          <option value="card">بطاقة</option>
+          <option value="iban">تحويل</option>
+        </select>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        <div>
+          <h3 className="font-black mb-2">المنيو</h3>
+          {menuItems.map((m) => (
+            <button
+              key={m.id}
+              onClick={() => addAdminOrderItem(m)}
+              className="w-full flex justify-between p-2 border-b"
+            >
+              <span>{getLocalizedValue(m, "name", adminLang)}</span>
+              <span>{m.price} TL</span>
+            </button>
+          ))}
+        </div>
+
+        <div>
+          <h3 className="font-black mb-2">الطلب</h3>
+          {orderItems.map((x) => {
+            const m = menuItems.find((i) => i.id === x.id);
+            return (
+              <div key={x.id} className="border p-2 mb-2 rounded-xl">
+                <div className="flex justify-between">
+                  <strong>{getLocalizedValue(m, "name", adminLang)}</strong>
+                  <button onClick={() => removeAdminOrderItem(x.id)}>❌</button>
+                </div>
+
+                <div className="flex gap-3 mt-2">
+                  <button onClick={() => changeAdminOrderQty(x.id, -1)}>-</button>
+                  <span>{x.quantity}</span>
+                  <button onClick={() => changeAdminOrderQty(x.id, 1)}>+</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+{createOrderError && (
+  <div className="mt-4 p-3 rounded-xl bg-red-100 text-red-700 font-bold">
+    {createOrderError}
+  </div>
+)}
+
+      <div className="flex justify-between mt-6">
+        <button
+          onClick={() => setCreateOrderOpen(false)}
+          className="px-6 py-3 bg-gray-200 rounded-xl"
+        >
+          إلغاء
+        </button>
+        <button
+  onClick={submitAdminOrder}
+  disabled={
+  !String(orderTable).trim() ||
+  orderItems.length === 0
+}
+  className="px-6 py-3 bg-orange-600 text-white rounded-xl font-black disabled:opacity-40"
+>
+  حفظ الطلب
+</button>
+
+      </div>
+    </div>
+  </div>
+)}
+
 
         <style
           dangerouslySetInnerHTML={{
@@ -1366,6 +2367,13 @@ const adminLogout = () => {
               className="bg-white p-5 rounded-[2.5rem] flex gap-5 border border-white shadow-sm hover:shadow-xl transition-all group"
             >
               <div className="relative overflow-hidden rounded-[1.8rem] w-32 h-32 shrink-0 bg-slate-100">
+                {item.isOffer && (
+  <div className="absolute top-3 right-3">
+    <span className="px-3 py-1 rounded-full text-[11px] font-black bg-red-100 text-red-700">
+      🔥 عرض
+    </span>
+  </div>
+)}
                 {item.outOfStock && (
   <div className="absolute top-3 left-3">
     <span className="px-3 py-1 rounded-full text-[11px] font-black bg-red-100 text-red-700">
@@ -1393,9 +2401,21 @@ const adminLogout = () => {
                 </div>
 
                 <div className="flex justify-between items-center mt-2">
-                  <span className="text-2xl font-black text-orange-600">
-                    {item.price} <small className="text-[10px] font-bold">TL</small>
-                  </span>
+                  {item.isOffer ? (
+  <div className="flex flex-col">
+    <span className="text-sm text-slate-400 line-through font-bold">
+      {item.oldPrice} TL
+    </span>
+    <span className="text-2xl font-black text-orange-600">
+      {item.price} <small className="text-[10px] font-bold">TL</small>
+    </span>
+  </div>
+) : (
+  <span className="text-2xl font-black text-orange-600">
+    {item.price} <small className="text-[10px] font-bold">TL</small>
+  </span>
+)}
+
 
                   <button
   onClick={() => {
@@ -1545,31 +2565,82 @@ const adminLogout = () => {
                 {cart.length > 0 && (
                   <div className="pt-6 space-y-4">
                     <p className="font-black text-slate-900">{t.payment}</p>
-                    <div className="grid grid-cols-2 gap-4">
-                      <button
-                        onClick={() => setPaymentMethod("cash")}
-                        className={`p-5 rounded-[1.8rem] border-2 flex flex-col items-center gap-2 transition-all ${
-                          paymentMethod === "cash"
-                            ? "border-orange-600 bg-orange-50 text-orange-600 shadow-lg shadow-orange-100"
-                            : "bg-white border-slate-100 text-slate-400"
-                        }`}
-                      >
-                        <Banknote size={24} />{" "}
-                        <span className="text-xs font-black">{t.cash}</span>
-                      </button>
+                    <div className="grid grid-cols-3 gap-4">
+  {/* cash */}
+  <button
+    onClick={() => { setPaymentMethod("cash"); setReceiptDataUrl(""); setReceiptError(""); }}
+    className={`p-5 rounded-[1.8rem] border-2 flex flex-col items-center gap-2 transition-all ${
+      paymentMethod === "cash"
+        ? "border-orange-600 bg-orange-50 text-orange-600 shadow-lg shadow-orange-100"
+        : "bg-white border-slate-100 text-slate-400"
+    }`}
+  >
+    <Banknote size={24} />
+    <span className="text-xs font-black">{t.cash}</span>
+  </button>
 
-                      <button
-                        onClick={() => setPaymentMethod("card")}
-                        className={`p-5 rounded-[1.8rem] border-2 flex flex-col items-center gap-2 transition-all ${
-                          paymentMethod === "card"
-                            ? "border-orange-600 bg-orange-50 text-orange-600 shadow-lg shadow-orange-100"
-                            : "bg-white border-slate-100 text-slate-400"
-                        }`}
-                      >
-                        <CreditCard size={24} />{" "}
-                        <span className="text-xs font-black">{t.card}</span>
-                      </button>
-                    </div>
+  {/* card */}
+  <button
+    onClick={() => { setPaymentMethod("card"); setReceiptDataUrl(""); setReceiptError(""); }}
+    className={`p-5 rounded-[1.8rem] border-2 flex flex-col items-center gap-2 transition-all ${
+      paymentMethod === "card"
+        ? "border-orange-600 bg-orange-50 text-orange-600 shadow-lg shadow-orange-100"
+        : "bg-white border-slate-100 text-slate-400"
+    }`}
+  >
+    <CreditCard size={24} />
+    <span className="text-xs font-black">{t.card}</span>
+  </button>
+
+  {/* iban */}
+  <button
+    onClick={() => { setPaymentMethod("iban"); setReceiptError(""); }}
+    className={`p-5 rounded-[1.8rem] border-2 flex flex-col items-center gap-2 transition-all ${
+      paymentMethod === "iban"
+        ? "border-orange-600 bg-orange-50 text-orange-600 shadow-lg shadow-orange-100"
+        : "bg-white border-slate-100 text-slate-400"
+    }`}
+  >
+    <Banknote size={24} />
+    <span className="text-xs font-black">{t.iban || "IBAN"}</span>
+  </button>
+</div>
+
+{paymentMethod === "iban" && (
+  <div className="mt-4 bg-slate-50 p-4 rounded-2xl space-y-3">
+    <div className="font-black text-slate-900">{t.ibanInfoTitle}</div>
+
+    <div className="text-sm font-bold text-slate-700">
+     رقم الطاولة: <span className="font-black">wingi</span>
+    </div>
+
+    <div className="text-sm font-bold text-slate-700 break-all">
+      IBAN: <span className="font-black">TR00000000000000000000000000000000000</span>
+    </div>
+
+    <div className="text-sm font-black text-red-600">
+      {t.receiptRequired}
+    </div>
+
+    <input
+      type="file"
+      accept="image/*"
+      onChange={(e) => {
+        const file = e.target.files?.[0];
+        if (!file) {
+          setReceiptDataUrl("");
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => setReceiptDataUrl(String(reader.result || ""));
+        reader.readAsDataURL(file);
+      }}
+      className="block w-full text-sm"
+    />
+  </div>
+)}
+
+
                   </div>
                 )}
               </div>
@@ -1585,33 +2656,46 @@ const adminLogout = () => {
                   </div>
 
                   <button
-                    disabled={!paymentMethod}
+                    disabled={!paymentMethod || (paymentMethod === "iban" && !receiptDataUrl)}
                     onClick={async () => {
-                      try {
-                        setOrderStatus("sending");
-                        await addDoc(
-                          collection(db, "artifacts", appId, "public", "data", "orders"),
-                          {
-                            table,
-                            items: cart,
-                            total: cart.reduce(
-                              (s, i) => s + (i.price || 0) * (i.quantity || 1),
-                              0
-                            ),
-                            paymentMethod,
-                            status: "new",
-                            timestamp: Date.now(),
-                          }
-                        );
-                        setOrderStatus("completed");
-                        setCart([]);
-                        setIsCartOpen(false);
-                        setPaymentMethod(null);
-                      } catch (e) {
-                        console.error(e);
-                        setOrderStatus(null);
-                      }
-                    }}
+  try {
+    setOrderStatus("sending");
+
+    const items = cart; // ✅ تعريف items هنا
+    const total = items.reduce(
+      (s, i) => s + (i.price || 0) * (i.quantity || 1),
+      0
+    );
+
+    await addDoc(
+      collection(db, "artifacts", appId, "public", "data", "orders"),
+      {
+        table,
+        items,
+        total,
+        paymentMethod,
+        receiptDataUrl: paymentMethod === "iban" ? receiptDataUrl : "",
+        ibanName: paymentMethod === "iban" ? "wingi" : "",
+        ibanNumber:
+          paymentMethod === "iban"
+            ? "TR00000000000000000000000000000000000"
+            : "",
+        status: "new",
+        timestamp: Date.now(),
+      }
+    );
+
+    setOrderStatus("completed");
+    setCart([]);
+    setIsCartOpen(false);
+    setPaymentMethod(null);
+    setReceiptDataUrl("");
+  } catch (e) {
+    console.error(e);
+    setOrderStatus(null);
+  }
+}}
+
                     className="w-full py-6 bg-orange-600 text-white rounded-[2rem] font-black text-xl shadow-2xl shadow-orange-200 disabled:opacity-30 active:scale-95 transition-all"
                   >
                     {t.completeOrder}
