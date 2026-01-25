@@ -188,6 +188,13 @@ markedBy: "تم بواسطة",
     portalHint: "This page is admin only",
     goPortal: "Back to Portal",
     missingApiKey: "Translation needs an API key",
+      notes: "Special notes (optional)",
+  addToCart: "Add to cart",
+  skip: "Skip",
+  outOfStock: "Out of stock",
+  available: "Available",
+  notesPlaceholder: "Example: no onion / extra sauce...",
+
   },
   tr: {
     brand: "Wingi",
@@ -233,6 +240,13 @@ markedBy: "تم بواسطة",
     portalHint: "Bu sayfa sadece yönetici için",
     goPortal: "Portala Dön",
     missingApiKey: "Çeviri için API anahtarı gerekli",
+      notes: "Özel notlar (isteğe bağlı)",
+  addToCart: "Sepete ekle",
+  skip: "Atla",
+  outOfStock: "Stok tükendi",
+  available: "Mevcut",
+  notesPlaceholder: "Örn: soğansız / ekstra sos...",
+
   },
 };
 
@@ -1428,7 +1442,7 @@ const adminLogout = () => {
       <textarea
         value={notesText}
         onChange={(e) => setNotesText(e.target.value)}
-        placeholder="مثال: بدون بصل / زيادة صوص..."
+        placeholder={t.notesPlaceholder}
         className="w-full p-4 rounded-2xl border h-28"
       />
 
