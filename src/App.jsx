@@ -483,6 +483,53 @@ const [createOrderError, setCreateOrderError] = useState("");
 const [orderDiscount, setOrderDiscount] = useState(0); // نسبة الخصم %
 const [uploadingImage, setUploadingImage] = useState(false);
 const [imageUploadError, setImageUploadError] = useState("");
+// ✅ خصم خاص بالدفع كاش (إعداد عام)
+const [cashDiscountPercent, setCashDiscountPercent] = useState(0);
+
+
+// VIP Customers
+const [vipOpen, setVipOpen] = useState(false);
+const [vipList, setVipList] = useState([]);
+const [vipName, setVipName] = useState("");
+const [vipDiscount, setVipDiscount] = useState(0);
+const [vipError, setVipError] = useState("");
+
+// داخل create order
+const [vipPickerOpen, setVipPickerOpen] = useState(false);
+const [selectedVip, setSelectedVip] = useState(null);
+
+// ===== Preview totals (Admin Create Order) =====
+const adminPreviewItems = useMemo(() => {
+  return (orderItems || [])
+    .map((it) => {
+      const m = menuItems.find((x) => x.id === it.id) || {};
+      const qty = Number(it.quantity || 1);
+      const price = Number(m.price || it.price || 0);
+
+      return { ...it, quantity: qty, price };
+    })
+    .filter((x) => x.id);
+}, [orderItems, menuItems]);
+
+const adminSubtotal = useMemo(() => {
+  return adminPreviewItems.reduce(
+    (s, it) => s + Number(it.price || 0) * Number(it.quantity || 1),
+    0
+  );
+}, [adminPreviewItems]);
+
+const adminDiscountPercent = useMemo(() => {
+  return Math.min(100, Math.max(0, Number(orderDiscount || 0)));
+}, [orderDiscount]);
+
+const adminDiscountAmount = useMemo(() => {
+  return (adminSubtotal * adminDiscountPercent) / 100;
+}, [adminSubtotal, adminDiscountPercent]);
+
+const adminTotal = useMemo(() => {
+  return Math.max(0, adminSubtotal - adminDiscountAmount);
+}, [adminSubtotal, adminDiscountAmount]);
+
 
 
 
@@ -628,8 +675,25 @@ useEffect(() => {
     setAdminUsers(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
   });
 
+  
+
   return () => unsub();
 }, [user, adminSession]);
+
+// ✅ VIP list realtime (خليها لوحدها)
+useEffect(() => {
+  if (!user) return;
+  if (!adminSession) return;
+
+  const unsub = onSnapshot(collection(db, ...vipCustomersColPath), (snap) => {
+    const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    arr.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+    setVipList(arr);
+  });
+
+  return () => unsub();
+}, [user, adminSession]);
+
 
   /* =========================
      Localization helpers
@@ -715,6 +779,23 @@ useEffect(() => {
 };
 
 
+// ✅ تطبيق خصم الكاش تلقائيًا عند اختيار طريقة الدفع
+useEffect(() => {
+  // لو مختار VIP -> خله هو الخصم
+  if (selectedVip) {
+    setOrderDiscount(Number(selectedVip.discountPercent || 0));
+    return;
+  }
+
+  // لو ما فيه VIP -> خصم الكاش فقط
+  if (orderPay === "cash") {
+    setOrderDiscount(Number(cashDiscountPercent || 0));
+  } else {
+    setOrderDiscount(0);
+  }
+}, [orderPay, cashDiscountPercent, selectedVip]);
+
+
 
 // ===== Admin create order helpers =====
 const addAdminOrderItem = (menuItem) => {
@@ -745,66 +826,119 @@ const removeAdminOrderItem = (id) => {
   setOrderItems((prev) => prev.filter((x) => x.id !== id));
 };
 
+// ✅ VIP helpers (لازم تكون خارج submitAdminOrder)
+const addVipCustomer = async () => {
+  setVipError("");
+
+  const name = String(vipName || "").trim();
+  const disc = Math.min(100, Math.max(0, Number(vipDiscount || 0)));
+
+  if (!name) {
+    setVipError("اكتب اسم العميل");
+    return;
+  }
+
+  const id = `${name}_${Date.now()}`.replace(/\s+/g, "_");
+
+  await setDoc(doc(db, ...vipCustomersColPath, id), {
+    name,
+    discountPercent: disc,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+
+  setVipName("");
+  setVipDiscount(0);
+  setVipOpen(false);
+};
+
+const chooseVipForOrder = (vip) => {
+  setSelectedVip(vip);
+  setOrderTable(vip.name);
+  setOrderDiscount(Number(vip.discountPercent || 0));
+  setVipPickerOpen(false);
+};
+
+const clearVipForOrder = () => {
+  setSelectedVip(null);
+  setOrderTable("");
+  setOrderDiscount(0);
+};
+
+
 const submitAdminOrder = async () => {
-  setCreateOrderError("");
+  try {
+    setCreateOrderError("");
 
-  // ✅ الاسم (بدل المستلم/رقم الطاولة)
-  if (!String(orderTable).trim()) {
-    setCreateOrderError("اكتب الاسم");
-    return;
-  }
+    if (!String(orderTable).trim()) {
+      setCreateOrderError("اكتب اسم المستلم");
+      return;
+    }
+    if (!orderItems || orderItems.length === 0) {
+      setCreateOrderError("اختر منتجات");
+      return;
+    }
 
-  if (orderItems.length === 0) {
-    setCreateOrderError("اختر منتجات من المنيو");
-    return;
+    // جهز العناصر بشكل صحيح (يربط id بالمنيو للحصول على الاسم + السعر)
+    const items = (orderItems || [])
+      .map((it) => {
+        const m = menuItems.find((x) => x.id === it.id) || {};
+        const qty = Number(it.quantity || 1);
+
+        return {
+          id: it.id,
+          quantity: qty,
+          note: it.note || "",
+          price: Number(m.price || it.price || 0),
+
+          // نخزن أسماء المنتج بكل اللغات عشان تظهر في الفاتورة والطلبات
+          nameAr: m.nameAr || it.nameAr || "",
+          nameEn: m.nameEn || it.nameEn || "",
+          nameTr: m.nameTr || it.nameTr || "",
+
+          _key: `${it.id}__${it.note || ""}`,
+        };
+      })
+      .filter((x) => x.id);
+
+    const subtotal = items.reduce(
+      (s, it) => s + Number(it.price || 0) * Number(it.quantity || 1),
+      0
+    );
+
+    const discountPercent = Math.min(100, Math.max(0, Number(orderDiscount || 0)));
+    const discountAmount = (subtotal * discountPercent) / 100;
+    const total = Math.max(0, subtotal - discountAmount);
+
+    await addDoc(collection(db, "artifacts", appId, "public", "data", "orders"), {
+      table: orderTable,
+      items,
+      subtotal,
+      discountPercent,
+      discountAmount,
+      total,
+      paymentMethod: orderPay,
+      status: "new",
+      timestamp: Date.now(),
+    });
+
+    // reset
+    setCreateOrderOpen(false);
+    setOrderTable("");
+    setOrderPay("cash");
+    setOrderItems([]);
+    setCreateOrderError("");
+    setSelectedVip(null);
+    setOrderDiscount(0);
+  } catch (e) {
+    console.error(e);
+    setCreateOrderError("فشل حفظ الطلب");
   }
+};
 
 
   // ✅ جهز العناصر بصيغة الفاتورة + الملاحظات
-  const items = (orderItems || []).map((it) => ({
-    ...it,
-    quantity: it.quantity || 1,
-    note: it.note || "",
-    _key: `${it.id}__${it.note || ""}`,
-  }));
-
-  const subtotal = items.reduce(
-  (s, it) => s + (Number(it.price || 0) * Number(it.quantity || 1)),
-  0
-);
-
-const discountPercent = Math.min(100, Math.max(0, Number(orderDiscount || 0)));
-const discountAmount = (subtotal * discountPercent) / 100;
-const total = Math.max(0, subtotal - discountAmount);
-
-
-  await addDoc(collection(db, "artifacts", appId, "public", "data", "orders"), {
-  table: orderTable,
-  items,
-
-  subtotal,
-  discountPercent,
-  discountAmount,
-  total,
-
-  paymentMethod: orderPay,
-  status: "new",
-  timestamp: Date.now(),
-});
-
-
-
-  setCreateOrderOpen(false);
-  setOrderTable("");
-  setOrderPay("cash");
-  setOrderItems([]);
-  setCreateOrderError("");
-  setReceiptDataUrl("");
-setReceiptError("");
-setOrderDiscount(0);
-
-
-};
+  
 
 
 
@@ -855,7 +989,13 @@ const printInvoice = (order) => {
       <hr />
       <table>${itemsHtml}</table>
       <hr />
-      <h3>Total: ${order.total} TL</h3>
+      ${order.discountPercent > 0 ? `
+  <p>Subtotal: ${order.subtotal} TL</p>
+  <p>Discount (${order.discountPercent}%): -${order.discountAmount} TL</p>
+` : ""}
+
+<h3>Total: ${order.total} TL</h3>
+
 
       <script>
         window.onload = function () {
@@ -927,6 +1067,7 @@ Return JSON only:
 // =========================
 const adminUsersColPath = ["artifacts", appId, "public", "data", "adminUsers"];
 const ownerDocPath = ["artifacts", appId, "public", "data", "adminConfig", "owner"];
+const vipCustomersColPath = ["artifacts", appId, "public", "data", "vipCustomers"];
 
 
 const adminLogin = async () => {
@@ -1249,68 +1390,91 @@ const adminRegister = async () => {
     className="min-h-screen bg-slate-50 font-sans"
     dir={adminLang === "ar" ? "rtl" : "ltr"}
   >
-    <header className="bg-white border-b px-8 py-5 flex justify-between items-center sticky top-0 z-50">
-      <div className="flex items-center gap-4">
-        <div className="bg-slate-950 p-2 rounded-xl text-white">
-          <Settings size={22} />
-        </div>
-        <div>
-          <h1 className="text-2xl font-black text-slate-900">
-            {admT.brand} — {admT.admin}
-          </h1>
-          <p className="text-[11px] text-slate-400 font-bold">appId: {appId}</p>
-        </div>
+    <header className="bg-white border-b px-8 py-5 sticky top-0 z-50">
+  <div className="flex flex-wrap items-center gap-3 justify-between">
+    {/* يسار: عنوان/شعار بسيط (اختياري) */}
+    <div className="flex items-center gap-3">
+      <div className="w-10 h-10 rounded-2xl bg-slate-950 text-white flex items-center justify-center font-black">
+        W
+      </div>
+      <div className="font-black text-slate-900">Admin</div>
+    </div>
+
+    {/* يمين: كل الأزرار */}
+    <div className="flex flex-wrap items-center gap-3">
+      {/* Admin language */}
+      <div className="flex bg-slate-100 p-1 rounded-2xl gap-1">
+        {["ar", "tr", "en"].map((l) => (
+          <button
+            key={l}
+            onClick={() => setAdminLang(l)}
+            className={`px-4 py-1.5 rounded-xl text-[10px] font-black uppercase transition-all ${
+              adminLang === l ? "bg-white shadow-sm text-slate-950" : "text-slate-400"
+            }`}
+          >
+            {l}
+          </button>
+        ))}
       </div>
 
-      <div className="flex items-center gap-4">
-        {/* Admin language */}
-        <div className="flex bg-slate-100 p-1 rounded-2xl gap-1">
-          {["ar", "tr", "en"].map((l) => (
-            <button
-              key={l}
-              onClick={() => setAdminLang(l)}
-              className={`px-4 py-1.5 rounded-xl text-[10px] font-black uppercase transition-all ${
-                adminLang === l
-                  ? "bg-white shadow-sm text-slate-950"
-                  : "text-slate-400"
-              }`}
-            >
-              {l}
-            </button>
-          ))}
-        </div>
+      <button
+        onClick={() => setAppMode("portal")}
+        className="bg-slate-100 text-slate-600 px-5 py-2 rounded-xl font-black hover:bg-slate-200 transition-all"
+      >
+        {admT.goPortal}
+      </button>
 
+      {adminSession?.role === "owner" && (
         <button
-          onClick={() => setAppMode("portal")}
-          className="bg-slate-100 text-slate-600 px-5 py-2 rounded-xl font-black hover:bg-slate-200 transition-all"
+          onClick={() => setAccountsOpen(true)}
+          className="bg-slate-950 text-white px-5 py-2 rounded-xl font-black hover:bg-black transition-all"
         >
-          {admT.goPortal}
+          Manage Accounts
         </button>
+      )}
 
-{adminSession?.role === "owner" && (
-  <button
-    onClick={() => setAccountsOpen(true)}
-    className="bg-slate-950 text-white px-5 py-2 rounded-xl font-black hover:bg-black transition-all"
-  >
-    Manage Accounts
-  </button>
-)}
+      <button
+        onClick={() => setCreateOrderOpen(true)}
+        className="bg-orange-600 text-white px-5 py-2 rounded-xl font-black hover:bg-orange-500 transition-all"
+      >
+        + إضافة طلب جديد
+      </button>
 
-<button
-  onClick={() => setCreateOrderOpen(true)}
-  className="bg-orange-600 text-white px-5 py-2 rounded-xl font-black hover:bg-orange-500 transition-all"
->
-  + إضافة طلب جديد
-</button>
+      <div className="flex items-center gap-2 bg-slate-50 px-4 py-2 rounded-xl">
+  <span className="text-sm font-black text-slate-700">
+    خصم الكاش %
+  </span>
+  <input
+    type="number"
+    min="0"
+    max="100"
+    value={cashDiscountPercent}
+    onChange={(e) =>
+      setCashDiscountPercent(Number(e.target.value || 0))
+    }
+    className="w-20 p-2 rounded-lg border text-center font-black"
+  />
+</div>
 
-        <button
-          onClick={adminLogout}
-          className="bg-slate-100 text-slate-600 px-5 py-2 rounded-xl font-black hover:bg-slate-200 transition-all"
-        >
-          {admT.logout} ({adminSession?.username})
-        </button>
-      </div>
-    </header>
+
+      {/* زر العميل الدائم */}
+      <button
+        onClick={() => setVipOpen(true)}
+        className="bg-emerald-600 text-white px-5 py-2 rounded-xl font-black hover:bg-emerald-500 transition-all"
+      >
+        + إضافة عميل دائم
+      </button>
+
+      <button
+        onClick={adminLogout}
+        className="bg-slate-100 text-slate-600 px-5 py-2 rounded-xl font-black hover:bg-slate-200 transition-all"
+      >
+        {admT.logout} ({adminSession?.username})
+      </button>
+    </div>
+  </div>
+</header>
+
 
     <main className="p-8 grid grid-cols-1 xl:grid-cols-12 gap-8 max-w-[1900px] mx-auto w-full">
       {/* كمل باقي لوحة الأدمن عندك هنا كما هي */}
@@ -1421,11 +1585,23 @@ const adminRegister = async () => {
 
                   </div>
 
-                  <div className="flex justify-between items-center gap-3">
-                    <span className="text-3xl font-black text-slate-900">
-                      {order.total}{" "}
-                      <small className="text-sm font-bold">TL</small>
-                    </span>
+                  <div className="space-y-1">
+  {order.discountPercent > 0 && (
+    <>
+      <div className="text-sm font-black text-slate-500">
+        المجموع قبل الخصم: {order.subtotal} TL
+      </div>
+      <div className="text-sm font-black text-orange-600">
+        خصم {order.discountPercent}% − {order.discountAmount} TL
+      </div>
+    </>
+  )}
+
+  <span className="text-3xl font-black text-slate-900">
+    الإجمالي: {order.total} TL
+  </span>
+</div>
+
 
                     <div className="flex gap-2">
   <button
@@ -1450,7 +1626,7 @@ const adminRegister = async () => {
   </button>
 </div>
 
-                  </div>
+                
                 </div>
               ))}
             </div>
@@ -1514,9 +1690,23 @@ const adminRegister = async () => {
                       </div>
 
                       <div className="flex justify-between items-center gap-2">
+  <div className="space-y-1">
+  {order.discountPercent > 0 && (
+    <>
+      <div className="text-xs font-black text-slate-500">
+        قبل الخصم: {order.subtotal} TL
+      </div>
+      <div className="text-xs font-black text-orange-600">
+        خصم {order.discountPercent}% − {order.discountAmount} TL
+      </div>
+    </>
+  )}
+
   <span className="text-2xl font-black text-slate-900">
-    {order.total} <small className="text-sm font-bold">TL</small>
+    الإجمالي: {order.total} TL
   </span>
+</div>
+
 
   <div className="flex gap-2">
     <button
@@ -1633,6 +1823,55 @@ const adminRegister = async () => {
   </div>
 )}
 
+{vipOpen && (
+  <div className="fixed inset-0 z-[260] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div className="w-full max-w-lg bg-white rounded-[2.5rem] p-6">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-2xl font-black text-slate-900">إضافة عميل دائم</h3>
+        <button
+          onClick={() => { setVipOpen(false); setVipError(""); }}
+          className="p-2 bg-slate-50 rounded-2xl text-slate-400"
+        >
+          <X size={18} />
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3">
+        <input
+          value={vipName}
+          onChange={(e) => setVipName(e.target.value)}
+          placeholder="اسم العميل"
+          className="p-3 rounded-xl border"
+        />
+
+        <input
+          type="number"
+          min="0"
+          max="100"
+          value={vipDiscount}
+          onChange={(e) => setVipDiscount(Number(e.target.value || 0))}
+          placeholder="نسبة الخصم الدائمة %"
+          className="p-3 rounded-xl border"
+        />
+
+        {vipError && (
+          <div className="p-3 rounded-xl bg-red-100 text-red-700 font-bold">
+            {vipError}
+          </div>
+        )}
+
+        <button
+          onClick={addVipCustomer}
+          className="py-3 rounded-xl bg-orange-600 text-white font-black"
+        >
+          حفظ العميل
+        </button>
+      </div>
+    </div>
+  </div>
+)}
+
+
 
 {createOrderOpen && (
   <div className="fixed inset-0 z-[250] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
@@ -1667,14 +1906,89 @@ const adminRegister = async () => {
           className="p-3 rounded-xl border"
         />
         <select
-          value={orderPay}
-          onChange={(e) => setOrderPay(e.target.value)}
-          className="p-3 rounded-xl border"
-        >
-          <option value="cash">كاش</option>
-          <option value="card">بطاقة</option>
-        </select>
+  value={orderPay}
+  onChange={(e) => setOrderPay(e.target.value)}
+  className="p-3 rounded-xl border font-black"
+>
+  <option value="cash">كاش</option>
+  <option value="card">بطاقة</option>
+  <option value="iban">تحويل إلى IBAN</option>
+</select>
+
+{orderPay === "iban" && (
+  <div className="mt-3 p-3 rounded-xl bg-orange-50 text-orange-700 font-bold text-sm">
+    سيتم الدفع عن طريق تحويل بنكي (IBAN)
+  </div>
+)}
+
       </div>
+
+
+      <div className="mb-6 flex items-center gap-3">
+  <button
+    type="button"
+    onClick={() => setVipPickerOpen(true)}
+    className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
+  >
+    + اختيار عميل دائم
+  </button>
+
+  {selectedVip && (
+    <div className="flex items-center gap-2">
+      <span className="text-sm font-black text-slate-700">
+        العميل: {selectedVip.name} — خصم {selectedVip.discountPercent}%
+      </span>
+      <button
+        type="button"
+        onClick={clearVipForOrder}
+        className="px-3 py-2 rounded-xl bg-slate-100 text-slate-700 font-black"
+      >
+        إزالة
+      </button>
+    </div>
+  )}
+</div>
+
+{vipPickerOpen && (
+  <div className="fixed inset-0 z-[270] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div className="w-full max-w-lg bg-white rounded-[2.5rem] p-6">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-xl font-black text-slate-900">اختر عميل دائم</h3>
+        <button
+          type="button"
+          onClick={() => setVipPickerOpen(false)}
+          className="p-2 bg-slate-50 rounded-2xl text-slate-400"
+        >
+          <X size={18} />
+        </button>
+      </div>
+
+      {vipList.length === 0 ? (
+        <div className="p-4 rounded-xl bg-slate-50 text-slate-500 font-bold">
+          لا يوجد عملاء دائمين بعد
+        </div>
+      ) : (
+        <div className="space-y-2 max-h-[55vh] overflow-y-auto">
+          {vipList.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              onClick={() => chooseVipForOrder(c)}
+              className="w-full p-4 rounded-2xl border flex items-center justify-between hover:bg-slate-50"
+            >
+              <div className="font-black text-slate-900">{c.name}</div>
+              <div className="text-sm font-black text-orange-600">
+                خصم {Number(c.discountPercent || 0)}%
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  </div>
+)}
+
+
 
       {/* المنيو */}
       <div className="mb-6">
@@ -1758,6 +2072,21 @@ const adminRegister = async () => {
           </div>
         )}
       </div>
+
+
+{/* ملخص الخصم */}
+{adminDiscountPercent > 0 && (
+  <div className="mt-4 p-4 rounded-xl bg-orange-50 text-orange-700 font-black space-y-1">
+    <div>المجموع قبل الخصم: {adminSubtotal.toFixed(2)} TL</div>
+    <div>نسبة الخصم: {adminDiscountPercent}%</div>
+    <div>قيمة الخصم: {adminDiscountAmount.toFixed(2)} TL</div>
+    <div className="text-slate-900">
+      الإجمالي بعد الخصم: {adminTotal.toFixed(2)} TL
+    </div>
+  </div>
+)}
+
+
 
       {/* خطأ */}
       {createOrderError && (
@@ -2129,101 +2458,7 @@ setCreateOrderError("");
   </div>
 )}
 
-{createOrderOpen && (
-  <div
-  className="bg-white w-full max-w-4xl rounded-3xl p-6 max-h-[90vh] overflow-y-auto"
-  onClick={(e) => e.stopPropagation()}
->
-    <div className="bg-white w-full max-w-4xl rounded-3xl p-6 max-h-[90vh] overflow-y-auto">
-      <h2 className="text-2xl font-black mb-4">إضافة طلب جديد</h2>
 
-      <div className="grid grid-cols-3 gap-3 mb-4">
-        <input
-          placeholder="مستلم الطلب"
-          className="border p-3 rounded-xl"
-        />
-        <input
-  value={orderTable}
-  onChange={(e) => setOrderTable(e.target.value)}
-  placeholder="رقم الطاولة :"
-  className="p-3 rounded-xl border"
-/>
-        <select
-          value={orderPay}
-          onChange={(e) => setOrderPay(e.target.value)}
-          className="border p-3 rounded-xl"
-        >
-          <option value="cash">كاش</option>
-          <option value="card">بطاقة</option>
-          <option value="iban">تحويل</option>
-        </select>
-      </div>
-
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <h3 className="font-black mb-2">المنيو</h3>
-          {menuItems.map((m) => (
-            <button
-              key={m.id}
-              onClick={() => addAdminOrderItem(m)}
-              className="w-full flex justify-between p-2 border-b"
-            >
-              <span>{getLocalizedValue(m, "name", adminLang)}</span>
-              <span>{m.price} TL</span>
-            </button>
-          ))}
-        </div>
-
-        <div>
-          <h3 className="font-black mb-2">الطلب</h3>
-          {orderItems.map((x) => {
-            const m = menuItems.find((i) => i.id === x.id);
-            return (
-              <div key={x.id} className="border p-2 mb-2 rounded-xl">
-                <div className="flex justify-between">
-                  <strong>{getLocalizedValue(m, "name", adminLang)}</strong>
-                  <button onClick={() => removeAdminOrderItem(x.id)}>❌</button>
-                </div>
-
-                <div className="flex gap-3 mt-2">
-                  <button onClick={() => changeAdminOrderQty(x.id, -1)}>-</button>
-                  <span>{x.quantity}</span>
-                  <button onClick={() => changeAdminOrderQty(x.id, 1)}>+</button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-{createOrderError && (
-  <div className="mt-4 p-3 rounded-xl bg-red-100 text-red-700 font-bold">
-    {createOrderError}
-  </div>
-)}
-
-      <div className="flex justify-between mt-6">
-        <button
-          onClick={() => setCreateOrderOpen(false)}
-          className="px-6 py-3 bg-gray-200 rounded-xl"
-        >
-          إلغاء
-        </button>
-        <button
-  onClick={submitAdminOrder}
-  disabled={
-  !String(orderTable).trim() ||
-  orderItems.length === 0
-}
-  className="px-6 py-3 bg-orange-600 text-white rounded-xl font-black disabled:opacity-40"
->
-  حفظ الطلب
-</button>
-
-      </div>
-    </div>
-  </div>
-)}
 
 
         <style
