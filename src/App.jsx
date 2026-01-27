@@ -19,6 +19,8 @@ import {
 
 import { getAnalytics } from "firebase/analytics";
 import { initializeApp } from "firebase/app";
+import { runTransaction, increment } from "firebase/firestore";
+
 
 
 import {
@@ -369,6 +371,12 @@ const [adminAuthError, setAdminAuthError] = useState("");
 const [ownerConfig, setOwnerConfig] = useState(null); // { ownerUsername, ownerPassword }
 const [isOwner, setIsOwner] = useState(false);
 
+
+// Admin navigation (NEW)
+const [adminPage, setAdminPage] = useState("menu"); // "menu" | "orders" | "inventory"
+const [ordersTab, setOrdersTab] = useState("active"); // "active" | "old"
+
+
 // لإدارة حسابات الموظفين (Owner فقط)
 const [accountsOpen, setAccountsOpen] = useState(false);
 const [adminUsers, setAdminUsers] = useState([]);
@@ -379,6 +387,14 @@ const [accPassword, setAccPassword] = useState("");
 
 const [newOwnerPass, setNewOwnerPass] = useState("");
 const [newOwnerUser, setNewOwnerUser] = useState("");
+
+// =========================
+// Firestore Paths (لازم تكون فوق قبل أي استخدام)
+// =========================
+const adminUsersColPath = ["artifacts", appId, "public", "data", "adminUsers"];
+const ownerDocPath = ["artifacts", appId, "public", "data", "adminConfig", "owner"];
+const vipCustomersColPath = ["artifacts", appId, "public", "data", "vipCustomers"];
+
 
 
 const updateOwnerCredentials = async () => {
@@ -450,7 +466,41 @@ useEffect(() => {
   const [table, setTable] = useState(null);
 
   const [menuItems, setMenuItems] = useState([]);
-  const [orders, setOrders] = useState([]);
+const [orders, setOrders] = useState([]);
+
+console.log("APP ID =", appId, "MENU =", menuItems.length);
+
+// ✅ Inventory
+const [inventory, setInventory] = useState([]);
+
+
+  // ===== Inventory =====
+
+  const [invNewName, setInvNewName] = useState("");
+const [invNewQty, setInvNewQty] = useState("");
+const [invNewError, setInvNewError] = useState("");
+
+
+const [invNewCost, setInvNewCost] = useState("");
+const [invNewSell, setInvNewSell] = useState("");
+const [invNewUnit, setInvNewUnit] = useState("kg"); // kg | piece | liter | none
+
+// ربط عنصر مخزون بمنتجات المنيو
+const [invLinkOpen, setInvLinkOpen] = useState(false);
+const [invLinkTarget, setInvLinkTarget] = useState(null); // inventory item
+const [invLinkRows, setInvLinkRows] = useState([]); // [{menuId, amountPerOne}]
+
+
+// ✅ NEW: روابط الوصفة وقت إضافة عنصر مخزون جديد
+const [invNewLinksOpen, setInvNewLinksOpen] = useState(false);
+const [invNewLinks, setInvNewLinks] = useState([]); // [{ menuId, amountPerOne }]
+// ✅ وحدة الإدخال للوصفة (جرام / مل / قطعة)
+const [invNewLinksInputUnit, setInvNewLinksInputUnit] = useState("");
+
+
+
+
+
 
   // Cart
   const [cart, setCart] = useState([]);
@@ -499,6 +549,58 @@ const [vipEdit, setVipEdit] = useState(null); // وضع التعديل
 // داخل create order
 const [vipPickerOpen, setVipPickerOpen] = useState(false);
 const [selectedVip, setSelectedVip] = useState(null);
+
+const handleAddInventory = async () => {
+  try {
+    setInvNewError("");
+
+    if (!invNewName.trim()) {
+      setInvNewError("اكتب اسم المادة");
+      return;
+    }
+
+    const id = invNewName.trim().toLowerCase().replace(/\s+/g, "_");
+
+    await setDoc(
+      doc(db, "artifacts", appId, "public", "data", "inventory", id),
+      {
+        name: invNewName.trim(),
+        unit: invNewUnit,
+        costPrice: Number(invNewCost || 0),
+        sellPrice: Number(invNewSell || 0),
+        quantity: invNewUnit === "none" ? 999999999 : Number(invNewQty || 0),
+        baselineQuantity:
+          invNewUnit === "none" ? 999999999 : Number(invNewQty || 0),
+        lowPercent: 0.2,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+      { merge: true }
+    );
+
+    setInvNewName("");
+    setInvNewCost("");
+    setInvNewSell("");
+    setInvNewQty("");
+    setInvNewUnit("kg");
+    setInvNewLinks([]);
+    setInvNewLinksOpen(false);
+  } catch (e) {
+    console.error(e);
+    setInvNewError("فشل إضافة المخزون");
+  }
+};
+
+
+const deleteInventory = async (invId) => {
+  const ok = confirm("حذف عنصر المخزون؟");
+  if (!ok) return;
+
+  await deleteDoc(
+    doc(db, "artifacts", appId, "public", "data", "inventory", invId)
+  );
+};
+
 
 // ===== Preview totals (Admin Create Order) =====
 const adminPreviewItems = useMemo(() => {
@@ -585,11 +687,79 @@ const adminTotal = useMemo(() => {
       }
     );
 
+     const unsubInv = onSnapshot(
+    collection(db, "artifacts", appId, "public", "data", "inventory"),
+    (snap) => {
+      setInventory(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    }
+  );
     return () => {
       unsubMenu();
       unsubOrders();
+       unsubInv();
     };
   }, [user]);
+
+  const refreshOutOfStockForAllMenu = async () => {
+    
+  try {
+    const invMap = new Map(inventory.map((x) => [x.id, Number(x.quantity || 0)]));
+
+    const updates = [];
+
+    for (const m of menuItems) {
+      const recipe = Array.isArray(m.recipe) ? m.recipe : [];
+
+      if (recipe.length === 0) {
+        if (m.outOfStock) {
+          updates.push(
+            updateDoc(doc(db, "artifacts", appId, "public", "data", "menu", m.id), {
+              outOfStock: false,
+              updatedAt: Date.now(),
+            })
+          );
+        }
+        continue;
+      }
+
+      let out = false;
+
+      for (const ing of recipe) {
+        const invQty = Number(invMap.get(ing.invId) ?? 0);
+        const needForOne = Number(ing.amountPerOne || 0);
+        if (needForOne <= 0) continue;
+
+        // ✅ الشرط المطلوب: أقل من احتياج صنف واحد
+        if (invQty < needForOne) {
+          out = true;
+          break;
+        }
+      }
+
+      if (!!m.outOfStock !== out) {
+        updates.push(
+          updateDoc(doc(db, "artifacts", appId, "public", "data", "menu", m.id), {
+            outOfStock: out,
+            updatedAt: Date.now(),
+          })
+        );
+      }
+    }
+
+    if (updates.length) await Promise.all(updates);
+  } catch (e) {
+    console.error(e);
+  }
+};
+
+
+useEffect(() => {
+  if (!menuItems.length) return;
+  refreshOutOfStockForAllMenu();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [inventory, menuItems]);
+
+
 
   const uploadMenuImage = async (file) => {
   setImageUploadError("");
@@ -726,6 +896,60 @@ useEffect(() => {
     [orders]
   );
 
+  const inventoryAlerts = useMemo(() => {
+  const invMap = new Map(inventory.map((x) => [x.id, x]));
+  const usedInv = new Map(); // invId -> أقل كمية لصنع منتج واحد
+
+  // نجمع أقل amountPerOne لكل عنصر مخزون (يعني: أقل كمية يحتاجها منتج واحد)
+  for (const m of menuItems) {
+    const recipe = Array.isArray(m.recipe) ? m.recipe : [];
+    for (const r of recipe) {
+      if (!r?.invId) continue;
+      const need = Number(r.amountPerOne || 0);
+      if (need <= 0) continue;
+
+      const prev = usedInv.get(r.invId);
+      if (!prev || need < prev) usedInv.set(r.invId, need);
+    }
+  }
+
+  const out = [];
+  const low = [];
+
+  for (const [invId, minNeedForOne] of usedInv.entries()) {
+    const inv = invMap.get(invId);
+    if (!inv || inv.unit === "none") continue;
+
+    const qty = Number(inv.quantity || 0);
+    const base = Number(inv.baselineQuantity || 0);
+    const lowPercent = Number(inv.lowPercent ?? 0.2);
+
+    // 🚫 لا يكفي لصنع منتج واحد
+    if (qty < minNeedForOne) {
+      out.push({
+        invId,
+        name: inv.name || inv.id,
+        qty,
+        needForOne: minNeedForOne,
+      });
+      continue;
+    }
+
+    // ⚠️ اقترب من 20%
+    if (base > 0 && qty <= base * lowPercent) {
+      low.push({
+        invId,
+        name: inv.name || inv.id,
+        qty,
+        base,
+      });
+    }
+  }
+
+  return { out, low };
+}, [inventory, menuItems]);
+
+
   const handleStartOrder = (tableNumber) => {
     setTable(tableNumber);
     setCart([]);
@@ -767,18 +991,112 @@ useEffect(() => {
      ========================= */
  const markOrder = async (orderId, status) => {
   try {
-    await updateDoc(
-      doc(db, "artifacts", appId, "public", "data", "orders", orderId),
-      {
+    const orderRef = doc(db, "artifacts", appId, "public", "data", "orders", orderId);
+
+    // لو مو "prepared" فقط غيّر الحالة بدون خصم
+    if (status !== "prepared") {
+      await updateDoc(orderRef, {
         status,
         closedAt: Date.now(),
         closedBy: adminSession?.username || "unknown",
+      });
+      return;
+    }
+
+    // ✅ prepared: خصم المخزون + تحديث الطلب داخل Transaction
+    await runTransaction(db, async (tx) => {
+      const orderSnap = await tx.get(orderRef);
+      if (!orderSnap.exists()) throw new Error("Order not found");
+
+      const order = orderSnap.data() || {};
+
+      // ✅ منع الخصم مرتين
+      if (order.inventoryDeducted) {
+        // فقط حدّث الحالة إن احتجت
+        tx.update(orderRef, {
+          status: "prepared",
+          closedAt: Date.now(),
+          closedBy: adminSession?.username || "unknown",
+        });
+        return;
       }
-    );
+
+      const items = Array.isArray(order.items) ? order.items : [];
+      if (items.length === 0) {
+        tx.update(orderRef, {
+          status: "prepared",
+          closedAt: Date.now(),
+          closedBy: adminSession?.username || "unknown",
+          inventoryDeducted: true,
+          inventoryDeductedAt: Date.now(),
+        });
+        return;
+      }
+
+      // 1) نجمع الخصم المطلوب لكل ingredient (invId) عبر كل عناصر الطلب
+      //    deductionMap: invId -> totalToDeduct
+      const deductionMap = new Map();
+
+      for (const it of items) {
+        const itemId = it.id;
+        const qtyOrdered = Number(it.quantity || 1);
+
+        // نجيب المنيو من الذاكرة (menuItems)
+        const m = menuItems.find((x) => x.id === itemId);
+        const recipe = Array.isArray(m?.recipe) ? m.recipe : [];
+
+        
+        for (const ing of recipe) {
+          const invId = ing.invId;
+          const invObj = inventory.find((x) => x.id === invId);
+if (invObj?.unit === "none") continue;
+
+
+          const needForOne = Number(ing.amountPerOne || 0);
+          if (!invId || needForOne <= 0) continue;
+
+          const totalNeed = needForOne * qtyOrdered;
+          deductionMap.set(invId, (deductionMap.get(invId) || 0) + totalNeed);
+        }
+      }
+
+      // 2) نتأكد أن المخزون يكفي قبل الخصم (عشان ما يصير سالب)
+      //    ثم نكتب الخصم
+      for (const [invId, totalNeed] of deductionMap.entries()) {
+        const invRef = doc(db, "artifacts", appId, "public", "data", "inventory", invId);
+        const invSnap = await tx.get(invRef);
+
+        const currentQty = invSnap.exists() ? Number(invSnap.data()?.quantity || 0) : 0;
+        const newQty = currentQty - Number(totalNeed || 0);
+
+        // ✅ لو ما يكفي: امنع التحضير + اظهر سبب (بـ error)
+        if (newQty < 0) {
+          throw new Error(`Not enough inventory for: ${invId}`);
+        }
+
+        tx.set(
+          invRef,
+          { quantity: newQty, updatedAt: Date.now() },
+          { merge: true }
+        );
+      }
+
+      // 3) بعد ما خصمنا المخزون، نحدّث الطلب
+      tx.update(orderRef, {
+        status: "prepared",
+        closedAt: Date.now(),
+        closedBy: adminSession?.username || "unknown",
+        inventoryDeducted: true,
+        inventoryDeductedAt: Date.now(),
+      });
+    });
+
   } catch (e) {
     console.error(e);
+    alert("تعذر التحضير: المخزون غير كافي أو حصل خطأ.");
   }
 };
+
 
 
 // ✅ تطبيق خصم الكاش تلقائيًا عند اختيار طريقة الدفع
@@ -901,6 +1219,78 @@ const clearVipForOrder = () => {
   setSelectedVip(null);
   setOrderTable("");
   setOrderDiscount(0);
+};
+
+
+useEffect(() => {
+  if (!invLinkOpen || !invLinkTarget) return;
+
+  const rows = [];
+  for (const m of menuItems) {
+    const recipe = Array.isArray(m.recipe) ? m.recipe : [];
+    const found = recipe.find((r) => r.invId === invLinkTarget.id);
+    if (found) rows.push({ menuId: m.id, amountPerOne: Number(found.amountPerOne || 0) });
+  }
+  setInvLinkRows(rows);
+}, [invLinkOpen, invLinkTarget, menuItems]);
+
+const saveInvLinksToMenu = async () => {
+  if (!invLinkTarget) return;
+
+  if (invLinkTarget.unit === "none") {
+    alert("هذا العنصر (بدون كمية محددة) لا يحتاج ربط للوصفات.");
+    return;
+  }
+
+  const updates = [];
+
+  // (1) إضافة/تحديث الربط للأصناف المختارة
+  for (const row of invLinkRows) {
+    const menuId = row.menuId;
+    const amt = Number(row.amountPerOne || 0);
+    if (!menuId || amt <= 0) continue;
+
+    const m = menuItems.find((x) => x.id === menuId);
+    if (!m) continue;
+
+    const recipe = Array.isArray(m.recipe) ? [...m.recipe] : [];
+    const idx = recipe.findIndex((r) => r.invId === invLinkTarget.id);
+
+    const nextIng = { invId: invLinkTarget.id, amountPerOne: amt };
+    if (idx >= 0) recipe[idx] = nextIng;
+    else recipe.push(nextIng);
+
+    updates.push(
+      updateDoc(doc(db, "artifacts", appId, "public", "data", "menu", menuId), {
+        recipe,
+        updatedAt: Date.now(),
+      })
+    );
+  }
+
+  // (2) حذف الربط من الأصناف اللي كانت مرتبطة سابقاً وتم إلغاء تحديدها
+  const selectedSet = new Set(invLinkRows.map((r) => r.menuId));
+  for (const m of menuItems) {
+    const recipe = Array.isArray(m.recipe) ? [...m.recipe] : [];
+    const had = recipe.some((r) => r.invId === invLinkTarget.id);
+    if (!had) continue;
+
+    if (!selectedSet.has(m.id)) {
+      const next = recipe.filter((r) => r.invId !== invLinkTarget.id);
+      updates.push(
+        updateDoc(doc(db, "artifacts", appId, "public", "data", "menu", m.id), {
+          recipe: next,
+          updatedAt: Date.now(),
+        })
+      );
+    }
+  }
+
+  await Promise.all(updates);
+
+  setInvLinkOpen(false);
+  setInvLinkTarget(null);
+  setInvLinkRows([]);
 };
 
 
@@ -1103,9 +1493,7 @@ Return JSON only:
   // =========================
 // Admin Auth helpers (MUST be before any route returns)
 // =========================
-const adminUsersColPath = ["artifacts", appId, "public", "data", "adminUsers"];
-const ownerDocPath = ["artifacts", appId, "public", "data", "adminConfig", "owner"];
-const vipCustomersColPath = ["artifacts", appId, "public", "data", "vipCustomers"];
+
 
 
 const adminLogin = async () => {
@@ -1514,324 +1902,410 @@ const adminRegister = async () => {
 </header>
 
 
-    <main className="p-8 grid grid-cols-1 xl:grid-cols-12 gap-8 max-w-[1900px] mx-auto w-full">
-      {/* كمل باقي لوحة الأدمن عندك هنا كما هي */}
+{(inventoryAlerts.out.length > 0 || inventoryAlerts.low.length > 0) && (
+  <div className="px-6 pt-4 space-y-3">
+    {inventoryAlerts.out.length > 0 && (
+      <div className="p-4 rounded-2xl bg-red-50 border border-red-200">
+        <div className="font-black text-red-700 mb-2">
+          🚫 انتهت الكمية – لا يمكن صنع منتج
+        </div>
+        {inventoryAlerts.out.map((x) => (
+          <div key={x.invId} className="text-sm font-bold text-red-700">
+            • {x.name} — المتوفر: {x.qty} — يحتاج: {x.needForOne}
+          </div>
+        ))}
+      </div>
+    )}
 
-          {/* Orders */}
-          <div className="xl:col-span-8 space-y-8">
-            {/* Active */}
-            <div className="flex items-center justify-between">
-              <div className="flex items-center justify-between">
-  <h2 className="text-xl font-black">
-    {admT.activeOrders}
-  </h2>
-</div>
-
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {activeOrders.map((order) => (
-                <div
-                  key={order.id}
-                  className="bg-white p-6 rounded-[2.5rem] border-2 border-orange-200 shadow-2xl shadow-orange-50"
-                >
-                  <div className="flex justify-between items-start mb-6">
-                    <div>
-                      <span className="bg-slate-950 text-white px-5 py-2 rounded-2xl font-black text-xl">
-              رقم الطاولة : {order.table}
-                      </span>
-                      <div className="mt-2 text-xs text-slate-400 font-bold flex items-center gap-2">
-                        <Clock size={14} />
-                        {new Date(order.timestamp).toLocaleString()}
-                      </div>
-                    </div>
-
-                    <div
-  className={`px-4 py-2 rounded-2xl font-black flex items-center gap-2 ${
-    order.paymentMethod === "cash"
-      ? "bg-emerald-100 text-emerald-700"
-      : order.paymentMethod === "card"
-      ? "bg-blue-100 text-blue-700"
-      : "bg-orange-100 text-orange-700"
-  }`}
->
-  {order.paymentMethod === "cash" ? (
-    <Banknote size={18} />
-  ) : order.paymentMethod === "card" ? (
-    <CreditCard size={18} />
-  ) : (
-    <Banknote size={18} />
-  )}
-
-  {order.paymentMethod === "cash"
-    ? admT.cash
-    : order.paymentMethod === "card"
-    ? admT.card
-    : admT.iban}
-</div>
-
-{order.paymentMethod === "iban" && (
-  <div className="mt-3 bg-slate-50 p-3 rounded-2xl">
-    <div className="text-xs font-black text-slate-700 mb-2">
-      {admT.ibanInfoTitle}: wingi — {order.ibanNumber || "TR00000000000000000000000000000000000"}
-    </div>
-
-    {order.receiptDataUrl ? (
-      
-      <button
-  type="button"
-  onClick={() => {
-    setReceiptView(order.receiptDataUrl);
-    setReceiptOpen(true);
-  }}
-  className="text-sm font-black text-orange-600 underline"
->
-  عرض صورة الإيصال
-</button>
-
-
-    ) : (
-      <div className="text-xs font-black text-red-600">
-        لا يوجد إيصال مرفق
+    {inventoryAlerts.low.length > 0 && (
+      <div className="p-4 rounded-2xl bg-orange-50 border border-orange-200">
+        <div className="font-black text-orange-700 mb-2">
+          ⚠️ المخزون اقترب من الانتهاء (20%)
+        </div>
+        {inventoryAlerts.low.map((x) => (
+          <div key={x.invId} className="text-sm font-bold text-orange-700">
+            • {x.name} — المتبقي: {x.qty} من {x.base}
+          </div>
+        ))}
       </div>
     )}
   </div>
 )}
 
 
-                  </div>
 
-                  <div className="space-y-3 mb-6 bg-slate-50 p-4 rounded-2xl">
-                    {(order.items || []).map((it, idx) => (
-  <div key={idx} className="text-sm font-black">
-    <div className="flex justify-between items-center">
-      <span className="text-slate-600">
-        {it.quantity}x {getLocalizedValue(it, "name", adminLang)}
-      </span>
-      <span className="text-slate-900">
-        {(it.price || 0) * (it.quantity || 1)} TL
-      </span>
-    </div>
+   <main className="p-6 max-w-[1900px] mx-auto w-full">
+  <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
 
-    {it.note && (
-      <div className="mt-1 text-[11px] font-bold text-slate-500">
-        📝 {it.note}
+    {/* ===== SIDEBAR ===== */}
+    <aside className="xl:col-span-3">
+      <div className="bg-white rounded-[2rem] border p-4 sticky top-[92px]">
+        <div className="text-sm font-black text-slate-500 mb-3">
+          Navigation
+        </div>
+
+        <button
+          onClick={() => setAdminPage("menu")}
+          className={`w-full px-4 py-3 rounded-2xl font-black text-right ${
+            adminPage === "menu"
+              ? "bg-slate-950 text-white"
+              : "bg-slate-50 text-slate-700"
+          }`}
+        >
+          🍽️ قائمة الطعام
+        </button>
+
+        <button
+          onClick={() => setAdminPage("orders")}
+          className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+            adminPage === "orders"
+              ? "bg-slate-950 text-white"
+              : "bg-slate-50 text-slate-700"
+          }`}
+        >
+          🧾 الطلبات
+        </button>
+
+        <button
+          onClick={() => setAdminPage("inventory")}
+          className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+            adminPage === "inventory"
+              ? "bg-slate-950 text-white"
+              : "bg-slate-50 text-slate-700"
+          }`}
+        >
+          🧺 المخزون
+        </button>
       </div>
-    )}
+    </aside>
+
+    {/* ===== CONTENT ===== */}
+    <section className="xl:col-span-9 space-y-6">
+
+      {/* ============ MENU ============ */}
+      {adminPage === "menu" && (
+  <div className="space-y-6">
+    <h2 className="text-xl font-black">قائمة الطعام</h2>
+    <div className="flex items-center justify-between gap-3">
+  <div className="text-sm font-bold text-slate-500">
+    عدد المنتجات: {menuItems.length}
   </div>
-))}
 
-                  </div>
-
-                  <div className="space-y-1">
-  {order.discountPercent > 0 && (
-    <>
-      <div className="text-sm font-black text-slate-500">
-        المجموع قبل الخصم: {order.subtotal} TL
-      </div>
-      <div className="text-sm font-black text-orange-600">
-        خصم {order.discountPercent}% − {order.discountAmount} TL
-      </div>
-    </>
-  )}
-
-  <span className="text-3xl font-black text-slate-900">
-    الإجمالي: {order.total} TL
-  </span>
+  <button
+    onClick={() =>
+      setEditingItem({
+        nameAr: "",
+        nameEn: "",
+        nameTr: "",
+        descAr: "",
+        descEn: "",
+        descTr: "",
+        categoryAr: "",
+        categoryEn: "",
+        categoryTr: "",
+        price: 0,
+        image: "",
+        outOfStock: false,
+        isOffer: false,
+        oldPrice: 0,
+      })
+    }
+    className="bg-orange-600 text-white px-5 py-3 rounded-2xl font-black hover:bg-orange-500 transition-all"
+  >
+    + {admT.addProduct}
+  </button>
 </div>
 
+{/* عرض المنتجات الحالية */}
+{menuItems.length === 0 ? (
+  <div className="p-4 rounded-2xl bg-slate-50 text-slate-500 font-bold">
+    لا يوجد منتجات في المنيو
+  </div>
+) : (
+  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+    {menuItems.map((m) => (
+      <div key={m.id} className="bg-white border rounded-2xl p-4 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          {m.image ? (
+            <img
+              src={m.image}
+              alt=""
+              className="w-12 h-12 rounded-xl object-cover bg-slate-100"
+              onError={(e) => (e.currentTarget.style.display = "none")}
+            />
+          ) : (
+            <div className="w-12 h-12 rounded-xl bg-slate-100" />
+          )}
+
+          <div>
+            <div className="font-black text-slate-900">
+              {getLocalizedValue(m, "name", adminLang)}
+            </div>
+            <div className="text-xs text-slate-500 font-bold">
+              {Number(m.price || 0)} TL
+            </div>
+          </div>
+        </div>
+
+        <div className="flex gap-2">
+          <button
+            onClick={() => setEditingItem(m)}
+            className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
+          >
+            تعديل
+          </button>
+
+          <button
+            onClick={async () => {
+              const ok = confirm("حذف المنتج؟");
+              if (!ok) return;
+              await deleteDoc(doc(db, "artifacts", appId, "public", "data", "menu", m.id));
+            }}
+            className="px-4 py-2 rounded-xl bg-red-100 text-red-700 font-black"
+          >
+            حذف
+          </button>
+        </div>
+      </div>
+    ))}
+  </div>
+)}
+  </div>
+)}
+
+
+
+
+      {/* ============ ORDERS ============ */}
+      
+  
+      {/* ============ INVENTORY ============ */}
+      {adminPage === "inventory" && (
+        <div className="space-y-6">
+          <h2 className="text-xl font-black">المخزون</h2>
+
+          {/* نموذج الإضافة */}
+          <div className="bg-white p-4 rounded-2xl border space-y-3">
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+              <input
+                value={invNewName}
+                onChange={(e) => setInvNewName(e.target.value)}
+                placeholder="اسم المادة"
+                className="p-3 rounded-xl border"
+              />
+
+              <input
+                type="number"
+                value={invNewCost}
+                onChange={(e) => setInvNewCost(e.target.value)}
+                className="p-3 rounded-xl border"
+                placeholder="سعر الشراء"
+              />
+
+              <input
+                type="number"
+                value={invNewSell}
+                onChange={(e) => setInvNewSell(e.target.value)}
+                className="p-3 rounded-xl border"
+                placeholder="سعر البيع"
+              />
+
+              <select
+                value={invNewUnit}
+                onChange={(e) => setInvNewUnit(e.target.value)}
+                className="p-3 rounded-xl border font-black"
+              >
+                <option value="kg">كيلو</option>
+                <option value="liter">لتر</option>
+                <option value="piece">قطعة</option>
+                <option value="none">بدون كمية</option>
+              </select>
+
+              <input
+                type="number"
+                value={invNewQty}
+                onChange={(e) => setInvNewQty(e.target.value)}
+                className="p-3 rounded-xl border"
+                placeholder="الكمية"
+              />
+            </div>
+
+            <button
+              onClick={() => setInvNewLinksOpen(true)}
+              className="px-4 py-3 rounded-xl bg-slate-950 text-white font-black"
+            >
+              + ربط منتجات من المنيو
+            </button>
+
+            <button
+              onClick={handleAddInventory} // نفس دالة الحفظ عندك
+              className="w-full py-3 rounded-xl bg-orange-600 text-white font-black"
+            >
+              + إضافة للمخزون
+            </button>
+
+            {invNewError && (
+              <div className="text-sm font-black text-red-600">
+                {invNewError}
+              </div>
+            )}
+          </div>
+
+          {/* قائمة المخزون */}
+          <div className="bg-white p-4 rounded-2xl border">
+            {inventory.length === 0 ? (
+              <div className="p-4 rounded-2xl bg-slate-50 text-slate-500 font-bold">
+                لا يوجد عناصر مخزون
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {inventory.map((inv) => (
+                  <div
+                    key={inv.id}
+                    className="p-4 rounded-2xl border flex justify-between items-center"
+                  >
+                    <div>
+                      <div className="font-black">{inv.name}</div>
+                      <div className="text-xs text-slate-500 font-bold">
+                        الكمية: {inv.quantity} {inv.unit}
+                      </div>
+                    </div>
 
                     <div className="flex gap-2">
-  <button
-    onClick={() => printInvoice(order)}
-    className="bg-slate-950 text-white px-4 py-2 rounded-xl font-black"
-  >
-    🖨 طباعة فاتورة
-  </button>
+                      <button
+                        onClick={() => {
+                          setInvLinkTarget(inv);
+                          setInvLinkOpen(true);
+                        }}
+                        className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
+                      >
+                        ربط
+                      </button>
 
-  <button
-    onClick={() => markOrder(order.id, "prepared")}
-    className="bg-emerald-600 text-white px-4 py-2 rounded-xl font-black"
-  >
-    تم التحضير
-  </button>
+                      <button
+                        onClick={() => deleteInventory(inv.id)}
+                        className="px-4 py-2 rounded-xl bg-red-100 text-red-700 font-black"
+                      >
+                        حذف
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
-  <button
-    onClick={() => markOrder(order.id, "cancelled")}
-    className="bg-red-600 text-white px-4 py-2 rounded-xl font-black"
-  >
-    إلغاء
-  </button>
-</div>
+{adminPage === "orders" && (
+  <div className="space-y-6">
+    <div className="flex items-center justify-between">
+      <h2 className="text-xl font-black">الطلبات</h2>
 
-                
+      <div className="flex gap-2">
+        <button
+          onClick={() => setOrdersTab("active")}
+          className={`px-4 py-2 rounded-xl font-black ${
+            ordersTab === "active" ? "bg-orange-600 text-white" : "bg-slate-100 text-slate-700"
+          }`}
+        >
+          الطلبات النشطة
+        </button>
+
+        <button
+          onClick={() => setOrdersTab("old")}
+          className={`px-4 py-2 rounded-xl font-black ${
+            ordersTab === "old" ? "bg-orange-600 text-white" : "bg-slate-100 text-slate-700"
+          }`}
+        >
+          الطلبات القديمة
+        </button>
+      </div>
+    </div>
+
+    {(ordersTab === "active" ? activeOrders : oldOrders).length === 0 ? (
+      <div className="p-5 rounded-2xl bg-white border font-bold text-slate-500">
+        لا يوجد طلبات هنا
+      </div>
+    ) : (
+      <div className="space-y-3">
+        {(ordersTab === "active" ? activeOrders : oldOrders).map((o) => (
+          <div key={o.id} className="bg-white border rounded-2xl p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="font-black text-slate-900">
+                  {o.table ? `المستلم/الطاولة: ${o.table}` : "طلب"}
+                </div>
+                <div className="text-xs font-bold text-slate-500 mt-1">
+                  {o.timestamp ? new Date(o.timestamp).toLocaleString() : ""}
+                </div>
+              </div>
+
+              <div className="font-black text-slate-900">
+                الإجمالي: {Number(o.total || 0).toFixed(2)} TL
+              </div>
+            </div>
+
+            <div className="mt-3 space-y-1">
+              {(o.items || []).map((it, idx) => (
+                <div key={idx} className="text-sm font-bold text-slate-700">
+                  • {it.quantity}x {(it.nameAr || it.nameEn || it.nameTr || it.id)}
+                  {it.note ? <span className="text-slate-500"> — 📝 {it.note}</span> : null}
                 </div>
               ))}
             </div>
 
-            {/* Old Orders */}
-            <div className="pt-2">
-              <h2 className="text-xl font-black flex items-center gap-3 mb-4">
-                {admT.oldOrders}
-                <span className="bg-slate-950 text-white text-xs px-3 py-1 rounded-full">
-                  {oldOrders.length}
-                </span>
-              </h2>
+            {/* أزرار الإدارة للطلبات النشطة فقط */}
+            {o.status === "new" && (
+              <div className="mt-4 flex gap-2">
+                <button
+                  onClick={() => markOrder(o.id, "prepared")}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-black"
+                >
+                  تم التحضير
+                </button>
+                <button
+                  onClick={() => markOrder(o.id, "cancelled")}
+                  className="px-4 py-2 rounded-xl bg-red-600 text-white font-black"
+                >
+                  إلغاء
+                </button>
 
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                {oldOrders.map((order) => {
-                  const status = order.status;
-                  const isPrep = status === "prepared";
-                  return (
-                    <div
-                      key={order.id}
-                      className="bg-white p-6 rounded-[2.5rem] border border-slate-100 opacity-95"
-                    >
-                      <div className="flex justify-between items-start mb-5">
-                        <div>
-                          <span className="bg-slate-950 text-white px-5 py-2 rounded-2xl font-black text-xl">
-                            {admT.table} {order.table}
-                          </span>
-                          <div className="mt-2 text-xs text-slate-400 font-bold flex items-center gap-2">
-                            <Clock size={14} />
-                            {new Date(order.timestamp).toLocaleString()}
-                          </div>
-                          {order.closedBy && (
-  <div className="mt-2 text-[11px] text-slate-400 font-bold">
-    {admT.markedBy}: <span className="text-slate-700">{order.closedBy}</span>
+                <button
+                  onClick={() => printInvoice(o)}
+                  className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
+                >
+                  طباعة فاتورة
+                </button>
+              </div>
+            )}
+
+            {o.receiptDataUrl && (
+  <button
+    onClick={() => {
+      setReceiptView(o.receiptDataUrl);
+      setReceiptOpen(true);
+    }}
+    className="px-4 py-2 rounded-xl bg-blue-600 text-white font-black"
+  >
+    عرض الإيصال
+  </button>
+)}
+
+          </div>
+        ))}
+      </div>
+    )}
   </div>
 )}
 
-                        </div>
-
-                        <Pill variant={isPrep ? "green" : "red"}>
-                          {isPrep ? admT.prepared : admT.cancelled}
-                        </Pill>
-                      </div>
-
-                      <div className="space-y-2 bg-slate-50 p-4 rounded-2xl mb-5">
-                        {(order.items || []).slice(0, 6).map((it, idx) => (
-                          <div key={idx} className="flex justify-between text-sm font-black">
-                            <span className="text-slate-600">
-                              {it.quantity}x {getLocalizedValue(it, "name", adminLang)}
-                            </span>
-                            <span className="text-slate-900">
-                              {(it.price || 0) * (it.quantity || 1)} TL
-                            </span>
-                          </div>
-                        ))}
-                        {(order.items || []).length > 6 && (
-                          <div className="text-[11px] text-slate-400 font-bold">
-                            +{(order.items || []).length - 6} more...
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="flex justify-between items-center gap-2">
-  <div className="space-y-1">
-  {order.discountPercent > 0 && (
-    <>
-      <div className="text-xs font-black text-slate-500">
-        قبل الخصم: {order.subtotal} TL
-      </div>
-      <div className="text-xs font-black text-orange-600">
-        خصم {order.discountPercent}% − {order.discountAmount} TL
-      </div>
-    </>
-  )}
-
-  <span className="text-2xl font-black text-slate-900">
-    الإجمالي: {order.total} TL
-  </span>
-</div>
-
-
-  <div className="flex gap-2">
-    <button
-      onClick={() => printInvoice(order)}
-      className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black hover:bg-black transition-all"
-    >
-      🖨 طباعة فاتورة
-    </button>
-
-    <button
-      onClick={() =>
-        deleteDoc(
-          doc(db, "artifacts", appId, "public", "data", "orders", order.id)
-        )
-      }
-      className="px-4 py-2 rounded-xl bg-slate-100 text-slate-500 font-black hover:bg-red-50 hover:text-red-600 transition-all"
-      title="Delete"
-    >
-      <Trash2 size={16} />
-    </button>
+    </section>
   </div>
-</div>
+</main>
 
 
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
 
-          {/* Menu management */}
-          <div className="xl:col-span-4 space-y-6">
-            <div className="flex justify-between items-center">
-              <h2 className="text-xl font-black">{admT.menu}</h2>
-              <button
-                onClick={() => setEditingItem({})}
-                className="bg-slate-950 text-white p-3 rounded-2xl shadow-lg"
-                title={admT.addProduct}
-              >
-                <Plus />
-              </button>
-            </div>
 
-            <div className="space-y-3">
-              {menuItems.map((item) => (
-                <div
-                  key={item.id}
-                  className="bg-white p-4 rounded-3xl border border-slate-100 flex items-center gap-4 hover:shadow-md transition-all"
-                >
-                  <img
-                    src={item.image}
-                    alt=""
-                    className="w-16 h-16 rounded-2xl object-cover bg-slate-100"
-                    onError={(e) => (e.currentTarget.style.display = "none")}
-                  />
-                  <div className="flex-grow">
-                    <p className="font-black text-slate-900">
-                      {getLocalizedValue(item, "name", adminLang)}
-                    </p>
-                    <p className="text-xs text-slate-500 font-bold">
-                      {getLocalizedValue(item, "category", adminLang)}
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => setEditingItem(item)}
-                    className="p-2 text-slate-400 hover:text-slate-950"
-                    title="Edit"
-                  >
-                    <Edit3 size={18} />
-                  </button>
-                  <button
-                    onClick={() =>
-                      deleteDoc(
-                        doc(db, "artifacts", appId, "public", "data", "menu", item.id)
-                      )
-                    }
-                    className="p-2 text-red-300 hover:text-red-600"
-                    title="Delete"
-                  >
-                    <Trash2 size={18} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
-        </main>
 
         
 {receiptOpen && (
@@ -1865,10 +2339,7 @@ const adminRegister = async () => {
   <div className="fixed inset-0 z-[260] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
     <div className="w-full max-w-3xl bg-white rounded-[2.5rem] p-6">
       <div className="flex justify-between items-center mb-4">
-        <h3 className="text-2xl font-black text-slate-900">
-          العملاء الدائمون
-        </h3>
-
+        <h3 className="text-2xl font-black text-slate-900">العملاء الدائمون</h3>
         <button
           type="button"
           onClick={() => {
@@ -1991,6 +2462,237 @@ const adminRegister = async () => {
 
 
 
+{invLinkOpen && invLinkTarget && (
+  <div className="fixed inset-0 z-[300] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div className="w-full max-w-4xl bg-white rounded-[2.5rem] p-6 max-h-[90vh] overflow-y-auto">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-2xl font-black text-slate-900">
+          ربط المخزون بالمنيو — {invLinkTarget.name}
+        </h3>
+        <button
+          type="button"
+          onClick={() => {
+            setInvLinkOpen(false);
+            setInvLinkTarget(null);
+            setInvLinkRows([]);
+          }}
+          className="p-2 bg-slate-50 rounded-2xl text-slate-400"
+        >
+          <X size={18} />
+        </button>
+      </div>
+
+      <div className="text-sm font-bold text-slate-600 mb-4">
+        اختر أصناف من المنيو وحدد: كم يحتاج الصنف من هذا العنصر لكل 1.
+      </div>
+
+      <div className="space-y-2">
+        {menuItems.map((m) => {
+          const row = invLinkRows.find((r) => r.menuId === m.id);
+          const checked = !!row;
+
+          return (
+            <div key={m.id} className="p-4 rounded-2xl border flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={(e) => {
+                    const on = e.target.checked;
+                    setInvLinkRows((prev) => {
+                      if (on) return [...prev, { menuId: m.id, amountPerOne: 1 }];
+                      return prev.filter((x) => x.menuId !== m.id);
+                    });
+                  }}
+                  className="w-5 h-5"
+                />
+                <div>
+                  <div className="font-black text-slate-900">
+                    {getLocalizedValue(m, "name", adminLang)}
+                  </div>
+                  <div className="text-xs text-slate-500 font-bold">
+                    {Number(m.price || 0)} TL
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <div className="text-xs font-black text-slate-600">الكمية لكل 1</div>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={row?.amountPerOne ?? ""}
+                  disabled={!checked}
+                  onChange={(e) => {
+                    const v = Number(e.target.value || 0);
+                    setInvLinkRows((prev) =>
+                      prev.map((x) => (x.menuId === m.id ? { ...x, amountPerOne: v } : x))
+                    );
+                  }}
+                  className="w-28 p-2 rounded-xl border text-center font-black"
+                />
+                <div className="text-xs font-bold text-slate-500">
+                  {invNewLinksInputUnit || "-"}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="mt-6 flex justify-end gap-3">
+        <button
+          type="button"
+          onClick={() => {
+            setInvLinkOpen(false);
+            setInvLinkTarget(null);
+            setInvLinkRows([]);
+          }}
+          className="px-6 py-3 rounded-xl bg-slate-100 text-slate-700 font-black"
+        >
+          إلغاء
+        </button>
+
+        <button
+          type="button"
+          onClick={saveInvLinksToMenu}
+          className="px-6 py-3 rounded-xl bg-orange-600 text-white font-black"
+        >
+          حفظ الربط
+        </button>
+      </div>
+    </div>
+  </div>
+)}
+
+
+{invNewLinksOpen && (
+  <div className="fixed inset-0 z-[999] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div className="w-full max-w-4xl bg-white rounded-[2.5rem] p-6 max-h-[90vh] overflow-y-auto">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-2xl font-black text-slate-900">
+          ربط هذا العنصر بمنتجات المنيو
+        </h3>
+        <button
+          type="button"
+          onClick={() => setInvNewLinksOpen(false)}
+          className="p-2 bg-slate-50 rounded-2xl text-slate-400"
+        >
+          <X size={18} />
+        </button>
+      </div>
+
+      {/* اختيار وحدة الإدخال */}
+      <div className="mb-4 flex items-center gap-3">
+        <div className="text-sm font-black text-slate-700">وحدة الاستهلاك:</div>
+
+        {invNewUnit === "kg" && (
+          <select
+            value={invNewLinksInputUnit}
+            onChange={(e) => setInvNewLinksInputUnit(e.target.value)}
+            className="p-2 rounded-xl border font-black"
+          >
+            <option value="g">جرام (g)</option>
+            <option value="kg">كيلو (kg)</option>
+          </select>
+        )}
+
+        {invNewUnit === "liter" && (
+          <select
+            value={invNewLinksInputUnit}
+            onChange={(e) => setInvNewLinksInputUnit(e.target.value)}
+            className="p-2 rounded-xl border font-black"
+          >
+            <option value="ml">مل (ml)</option>
+            <option value="L">لتر (L)</option>
+          </select>
+        )}
+
+        {invNewUnit === "piece" && (
+          <div className="px-3 py-2 rounded-xl border font-black bg-slate-50">
+            قطعة (pcs)
+          </div>
+        )}
+      </div>
+
+      <div className="space-y-2">
+        {menuItems.length === 0 ? (
+          <div className="p-4 rounded-2xl bg-slate-50 text-slate-500 font-bold">
+            لا يوجد منتجات بالمنيو بعد
+          </div>
+        ) : (
+          menuItems.map((m) => {
+            const row = invNewLinks.find((r) => r.menuId === m.id);
+            const checked = !!row;
+
+            return (
+              <div key={m.id} className="p-4 rounded-2xl border flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(e) => {
+                      const on = e.target.checked;
+                      setInvNewLinks((prev) => {
+                        if (on) return [...prev, { menuId: m.id, amountPerOne: 1, inputUnit: invNewLinksInputUnit }];
+                        return prev.filter((x) => x.menuId !== m.id);
+                      });
+                    }}
+                    className="w-5 h-5"
+                  />
+                  <div>
+                    <div className="font-black text-slate-900">
+                      {getLocalizedValue(m, "name", adminLang)}
+                    </div>
+                    <div className="text-xs text-slate-500 font-bold">
+                      {Number(m.price || 0)} TL
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <div className="text-xs font-black text-slate-600">الكمية لكل 1</div>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={row?.amountPerOne ?? ""}
+                    disabled={!checked}
+                    onChange={(e) => {
+                      const v = Number(e.target.value || 0);
+                      setInvNewLinks((prev) =>
+                        prev.map((x) =>
+                          x.menuId === m.id ? { ...x, amountPerOne: v, inputUnit: invNewLinksInputUnit } : x
+                        )
+                      );
+                    }}
+                    className="w-28 p-2 rounded-xl border text-center font-black"
+                  />
+                  <div className="text-xs font-bold text-slate-500">
+                    {invNewUnit === "kg" ? invNewLinksInputUnit : invNewUnit === "liter" ? invNewLinksInputUnit : "pcs"}
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      <div className="mt-6 flex justify-end gap-3">
+        <button
+          type="button"
+          onClick={() => setInvNewLinksOpen(false)}
+          className="px-6 py-3 rounded-xl bg-slate-100 text-slate-700 font-black"
+        >
+          إغلاق
+        </button>
+      </div>
+    </div>
+  </div>
+)}
+
+
 {createOrderOpen && (
   <div className="fixed inset-0 z-[250] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
     <div className="w-full max-w-5xl bg-white rounded-[2.5rem] p-6 max-h-[90vh] overflow-y-auto">
@@ -2066,6 +2768,7 @@ const adminRegister = async () => {
     </div>
   )}
 </div>
+
 
 {vipPickerOpen && (
   <div className="fixed inset-0 z-[270] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
@@ -2478,6 +3181,7 @@ setCreateOrderError("");
         </button>
       </div>
 
+
       {/* تغيير كلمة مرور المالك (تصير PIN) */}
       <div className="bg-slate-50 p-4 rounded-2xl mb-6">
   <div className="font-black text-slate-800 mb-2">Owner credentials</div>
@@ -2580,14 +3284,25 @@ setCreateOrderError("");
 
 
         <style
-          dangerouslySetInnerHTML={{
-            __html: `
-          @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Arabic:wght@400;700;900&display=swap');
-          body { font-family: 'Noto Sans Arabic', sans-serif; }
-          .no-scrollbar::-webkit-scrollbar { display: none; }
-        `,
-          }}
-        />
+  dangerouslySetInnerHTML={{
+    __html: `
+      @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Arabic:wght@400;700;900&display=swap');
+      body { font-family: 'Noto Sans Arabic', sans-serif; }
+      .no-scrollbar::-webkit-scrollbar { display: none; }
+
+      /* 🔒 منع أسهم الزيادة والنقصان */
+      input[type="number"]::-webkit-outer-spin-button,
+      input[type="number"]::-webkit-inner-spin-button {
+        -webkit-appearance: none;
+        margin: 0;
+      }
+      input[type="number"] {
+        -moz-appearance: textfield;
+      }
+    `,
+  }}
+/>
+
       </div>
     );
   }
@@ -2664,6 +3379,7 @@ setCreateOrderError("");
   if (appMode === "customer" && view === "menu") {
     return (
       <div className="min-h-screen bg-slate-50 pb-32" dir={lang === "ar" ? "rtl" : "ltr"}>
+      
         <header className="sticky top-0 z-[60] bg-white/90 backdrop-blur-md border-b px-6 py-5 flex justify-between items-center">
           <div className="flex items-center gap-3">
             <div className="w-12 h-12 bg-slate-950 text-white rounded-2xl flex items-center justify-center font-black text-xl shadow-lg">
