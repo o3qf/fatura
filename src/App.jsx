@@ -52,6 +52,28 @@ import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "fire
 
 const CURRENCY = "₺"; // Turkish Lira
 
+// ===== Order Date Helper (VERY IMPORTANT) =====
+const orderDateToJS = (order) => {
+  const v =
+    order?.createdAt ??
+    order?.created_at ??
+    order?.timestamp ??
+    order?.date ??
+    order?.time;
+
+  if (!v) return null;
+
+  if (typeof v?.toDate === "function") return v.toDate();
+  if (typeof v?.seconds === "number") return new Date(v.seconds * 1000);
+  if (typeof v === "number") return new Date(v);
+
+  if (typeof v === "string") {
+    const d = new Date(v);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  return null;
+};
 
 
 /* =========================
@@ -165,6 +187,7 @@ ownerPin: "كلمة سر صاحب المطعم",
 createAccount: "إنشاء حساب",
 login: "تسجيل الدخول",
 logout: "تسجيل خروج",
+notesPlaceholder: "مثال: بدون بصل / صوص زيادة...",
 invalidCredentials: "اسم المستخدم أو كلمة المرور غير صحيحة",
 ownerPinWrong: "كلمة سر صاحب المطعم خاطئة",
 usernameTaken: "اسم المستخدم مستخدم مسبقًا",
@@ -174,7 +197,11 @@ iban: "تحويل إلى IBAN",
 ibanInfoTitle: "معلومات التحويل",
 receiptUploadTitle: "إرفاق إيصال التحويل",
 receiptRequired: "يجب إرفاق صورة الإيصال قبل تقديم الطلب",
-
+tax: "ضريبة القيمة المضافة",
+taxPercent: "نسبة الضريبة %",
+taxAmount: "قيمة الضريبة",
+totalBeforeTax: "قبل الضريبة",
+totalAfterTax: "الإجمالي بعد الضريبة",
   },
   en: {
     brand: "Wingi",
@@ -230,7 +257,11 @@ iban: "IBAN Transfer",
 ibanInfoTitle: "Transfer Info",
 receiptUploadTitle: "Upload receipt",
 receiptRequired: "You must upload the receipt image before submitting the order",
-
+tax: "VAT / Tax",
+taxPercent: "Tax %",
+taxAmount: "Tax amount",
+totalBeforeTax: "Before tax",
+totalAfterTax: "Total after tax",
   },
   tr: {
     brand: "Wingi",
@@ -286,7 +317,11 @@ iban: "IBAN Havale",
 ibanInfoTitle: "Havale Bilgileri",
 receiptUploadTitle: "Dekont yükle",
 receiptRequired: "Siparişi göndermeden önce dekont görseli yüklemelisiniz",
-
+tax: "KDV / Vergi",
+taxPercent: "Vergi %",
+taxAmount: "Vergi tutarı",
+totalBeforeTax: "Vergi öncesi",
+totalAfterTax: "Vergi sonrası toplam",
   },
 };
 
@@ -377,6 +412,35 @@ const [adminPage, setAdminPage] = useState("menu"); // "menu" | "orders" | "inve
 const [ordersTab, setOrdersTab] = useState("active"); // "active" | "old"
 
 
+
+
+// ===== Finance (Revenue / Expenses) =====
+// ===== Finance States =====
+const [financeMode, setFinanceMode] = useState("daily");
+const [finDate, setFinDate] = useState(() =>
+  new Date().toISOString().slice(0, 10)
+);
+const [finFrom, setFinFrom] = useState("");
+const [finTo, setFinTo] = useState("");
+
+const [finError, setFinError] = useState("");
+
+const inFinanceRange = (order) => {
+  const d = orderDateToJS(order);
+  if (!d) return false;
+
+  const ymd = d.toISOString().slice(0, 10);
+
+  if (financeMode === "daily") {
+    return ymd === finDate;
+  }
+
+  if (finFrom && ymd < finFrom) return false;
+  if (finTo && ymd > finTo) return false;
+  return true;
+};
+
+
 // لإدارة حسابات الموظفين (Owner فقط)
 const [accountsOpen, setAccountsOpen] = useState(false);
 const [adminUsers, setAdminUsers] = useState([]);
@@ -388,12 +452,15 @@ const [accPassword, setAccPassword] = useState("");
 const [newOwnerPass, setNewOwnerPass] = useState("");
 const [newOwnerUser, setNewOwnerUser] = useState("");
 
+const [taxPercent, setTaxPercent] = useState(0); // ✅ ضريبة عامة %
+
 // =========================
 // Firestore Paths (لازم تكون فوق قبل أي استخدام)
 // =========================
 const adminUsersColPath = ["artifacts", appId, "public", "data", "adminUsers"];
 const ownerDocPath = ["artifacts", appId, "public", "data", "adminConfig", "owner"];
 const vipCustomersColPath = ["artifacts", appId, "public", "data", "vipCustomers"];
+const financeDocPath = ["artifacts", appId, "public", "data", "appConfig", "finance"];
 
 
 
@@ -420,6 +487,39 @@ const updateOwnerCredentials = async () => {
 };
 
 
+const validateOldDates = (from, to) => {
+  if (!from && !to) return { ok: true };
+
+  const fromDate = from ? new Date(from) : null;
+  const toDate = to ? new Date(to) : null;
+
+  if (from && (!fromDate || isNaN(fromDate.getTime()))) {
+    return { ok: false, msg: "تاريخ البداية غير صحيح" };
+  }
+
+  if (to && (!toDate || isNaN(toDate.getTime()))) {
+    return { ok: false, msg: "تاريخ النهاية غير صحيح" };
+  }
+
+  if (fromDate && toDate && fromDate > toDate) {
+    return { ok: false, msg: "التاريخ غير صحيح: (من) يجب أن يكون قبل (إلى)" };
+  }
+
+  return { ok: true };
+};
+
+const applyOldOrdersFilter = () => {
+  const res = validateOldDates(oldFrom, oldTo);
+
+  if (!res.ok) {
+    setOldFilterError(res.msg);
+    setApplyOldFilter(false);
+    return;
+  }
+
+  setOldFilterError("");
+  setApplyOldFilter(true);
+};
 
 
 
@@ -507,6 +607,8 @@ const orderDateToJS = (o) => {
 
 
 const [applyOldFilter, setApplyOldFilter] = useState(false);
+const [oldFilterError, setOldFilterError] = useState("");
+
 
 const [orders, setOrders] = useState([]);
 
@@ -732,6 +834,40 @@ const deleteOrderPermanently = async (orderId) => {
     console.error(e);
     alert("خطأ أثناء الحذف");
   }
+};
+
+const exportInventoryCSV = () => {
+  const rows = (menuItems || []).map((it) => ({
+    id: it.id ?? "",
+    nameAr: it.nameAr ?? "",
+    nameEn: it.nameEn ?? "",
+    nameTr: it.nameTr ?? "",
+    price: it.price ?? "",
+    outOfStock: it.outOfStock ? "yes" : "no",
+  }));
+
+  const headers = Object.keys(rows[0] || { id: "", nameAr: "", nameEn: "", nameTr: "", price: "", outOfStock: "" });
+  const csv = [
+    headers.join(","),
+    ...rows.map((r) =>
+      headers
+        .map((h) => {
+          const v = String(r[h] ?? "");
+          // escape quotes + commas
+          const escaped = v.replace(/"/g, '""');
+          return /[,"\n]/.test(escaped) ? `"${escaped}"` : escaped;
+        })
+        .join(",")
+    ),
+  ].join("\n");
+
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "inventory.csv";
+  a.click();
+  URL.revokeObjectURL(url);
 };
 
 
@@ -1073,6 +1209,41 @@ useEffect(() => {
 }, [user]);
 
 
+
+useEffect(() => {
+  if (!user) return;
+
+  const ensureFinance = async () => {
+    const ref = doc(db, ...financeDocPath);
+    const snap = await getDoc(ref);
+
+    if (!snap.exists()) {
+      await setDoc(ref, {
+        cashDiscountPercent: 0,
+        taxPercent: 0,
+        updatedAt: Date.now(),
+      });
+      return;
+    }
+
+    const data = snap.data() || {};
+    if (typeof data.cashDiscountPercent !== "number" || typeof data.taxPercent !== "number") {
+      await setDoc(
+        ref,
+        {
+          cashDiscountPercent: Number(data.cashDiscountPercent || 0),
+          taxPercent: Number(data.taxPercent || 0),
+          updatedAt: Date.now(),
+        },
+        { merge: true }
+      );
+    }
+  };
+
+  ensureFinance();
+}, [user]);
+
+
 // (B) جلب ownerConfig realtime
 useEffect(() => {
   if (!user) return;
@@ -1111,6 +1282,21 @@ useEffect(() => {
 
   return () => unsub();
 }, [user, adminSession]);
+
+
+
+useEffect(() => {
+  if (!user) return;
+
+  const unsub = onSnapshot(doc(db, ...financeDocPath), (snap) => {
+    if (!snap.exists()) return;
+    const d = snap.data() || {};
+    setCashDiscountPercent(Number(d.cashDiscountPercent || 0));
+    setTaxPercent(Number(d.taxPercent || 0));
+  });
+
+  return () => unsub();
+}, [user]);
 
 
   /* =========================
@@ -1163,6 +1349,143 @@ useEffect(() => {
   return list;
 }, [orders, applyOldFilter, oldFrom, oldTo]);
 
+ const listToShow = ordersTab === "active" ? activeOrders : oldOrders;
+
+
+ const financeData = useMemo(() => {
+  const filteredOrders = (orders || []).filter((o) => {
+    const d = orderDateToJS(o);
+    if (!d) return false;
+
+    const ymd = d.toISOString().slice(0, 10);
+
+    if (financeMode === "daily") return ymd === finDate;
+    if (finFrom && ymd < finFrom) return false;
+    if (finTo && ymd > finTo) return false;
+    return true;
+  });
+
+  const soldMap = new Map();
+
+  filteredOrders.forEach((o) => {
+    (o.items || []).forEach((it) => {
+      const q = Number(it.quantity || 1);
+      soldMap.set(it.id, (soldMap.get(it.id) || 0) + q);
+    });
+  });
+
+  const rows = menuItems.map((m) => {
+    const soldQty = soldMap.get(m.id) || 0;
+    const cost = Number(m.cost || 0);
+    const sell = Number(m.price || 0);
+
+    return {
+      id: m.id,
+      name: m.nameAr || m.nameEn || m.name,
+      cost,
+      sell,
+      soldQty,
+      netOne: sell - cost,
+      netTotal: (sell - cost) * soldQty,
+    };
+  });
+
+  return {
+    rows,
+    totalNet: rows.reduce((s, r) => s + r.netTotal, 0),
+  };
+}, [orders, menuItems, financeMode, finDate, finFrom, finTo]);
+
+const financeWithInventory = useMemo(() => {
+  // ✅ فلترة الطلبات حسب التاريخ + (اختياري) حسب الحالة
+  const filteredOrders = (orders || []).filter((o) => {
+    if (!inFinanceRange(o)) return false;
+
+    // ✅ اختياري: احسب فقط الطلبات المحضّرة
+    // لو تبغاه يحسب كل الطلبات شيل الشرط هذا
+    if (o.status !== "prepared") return false;
+
+    return true;
+  });
+
+  // مباع لكل منتج
+  const soldMap = new Map(); // menuId -> qty
+  filteredOrders.forEach((o) => {
+    (o.items || []).forEach((it) => {
+      const q = Number(it.quantity || 1);
+      soldMap.set(it.id, (soldMap.get(it.id) || 0) + q);
+    });
+  });
+
+  // خرائط للمخزون
+  const invMap = new Map(inventory.map((x) => [x.id, x])); // invId -> invObj
+
+  // ✅ إجمالي الاستهلاك لكل عنصر مخزون عبر كل المنتجات
+  const invUsageTotalMap = new Map(); // invId -> usedQty
+
+  // صفوف المنتجات (مع استهلاك المخزون لكل منتج)
+  const rows = menuItems.map((m) => {
+    const soldQty = soldMap.get(m.id) || 0;
+    const cost = Number(m.cost || 0);
+    const sell = Number(m.price || 0);
+
+    const recipe = Array.isArray(m.recipe) ? m.recipe : [];
+
+    // استهلاك المخزون لهذا المنتج
+    const usage = recipe
+      .map((ing) => {
+        const invId = ing.invId;
+        const needForOne = Number(ing.amountPerOne || 0);
+        if (!invId || needForOne <= 0 || soldQty <= 0) return null;
+
+        const inv = invMap.get(invId);
+        if (!inv || inv.unit === "none") return null;
+
+        const used = needForOne * soldQty; // ✅ الاستهلاك = لكل 1 * المباع
+        invUsageTotalMap.set(invId, (invUsageTotalMap.get(invId) || 0) + used);
+
+        return {
+          invId,
+          invName: inv.name || invId,
+          unit: inv.unit,       // g / ml / piece
+          used,
+          perOne: needForOne,
+        };
+      })
+      .filter(Boolean);
+
+    return {
+      id: m.id,
+      name: m.nameAr || m.nameEn || m.nameTr || m.name || m.id,
+      cost,
+      sell,
+      soldQty,
+      netOne: sell - cost,
+      netTotal: (sell - cost) * soldQty,
+      usage, // ✅ تفاصيل الاستهلاك لهذا المنتج
+    };
+  });
+
+  // ✅ جدول إجمالي استهلاك المخزون
+  const invRows = Array.from(invUsageTotalMap.entries())
+    .map(([invId, used]) => {
+      const inv = invMap.get(invId) || {};
+      return {
+        invId,
+        name: inv.name || invId,
+        unit: inv.unit || "-",
+        used: Number(used || 0),
+        currentQty: inv.unit === "none" ? "" : Number(inv.quantity || 0),
+      };
+    })
+    .sort((a, b) => (b.used || 0) - (a.used || 0));
+
+  return {
+    rows,
+    invRows,
+    totalNet: rows.reduce((s, r) => s + Number(r.netTotal || 0), 0),
+  };
+}, [orders, menuItems, inventory, financeMode, finDate, finFrom, finTo]);
 
 
   const inventoryAlerts = useMemo(() => {
@@ -1670,6 +1993,14 @@ const submitAdminOrder = async () => {
     const discountAmount = (subtotal * discountPercent) / 100;
     const total = Math.max(0, subtotal - discountAmount);
 
+    const taxP = Math.min(100, Math.max(0, Number(taxPercent || 0)));
+const taxAmount = (total * taxP) / 100;
+const totalWithTax = total + taxAmount;
+
+
+
+    
+
     await addDoc(collection(db, "artifacts", appId, "public", "data", "orders"), {
       table: orderTable,
       items,
@@ -1680,6 +2011,15 @@ const submitAdminOrder = async () => {
       paymentMethod: orderPay,
       status: "new",
       timestamp: Date.now(),
+
+      // ✅ الضريبة
+  taxPercent: taxP,
+  taxAmount,
+  totalWithTax,
+
+  paymentMethod: orderPay,
+  status: "new",
+  timestamp: Date.now(),
     });
 
     // reset
@@ -1712,6 +2052,30 @@ const printInvoice = (order) => {
     ? "Card"
     : "Transfer (IBAN)";
 
+
+
+const downloadCSV = (filename, rows) => {
+  const csv = rows.map(r => r.join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+};
+
+const exportInventoryCSV = () => {
+  const rows = [
+    ["المادة", "الاستخدام", "الوحدة", "المتبقي"],
+    ...financeWithInventory.invRows.map(i => [
+      i.name,
+      i.used,
+      i.unit,
+      i.currentQty,
+    ])
+  ];
+  downloadCSV("inventory_usage.csv", rows);
+};
 
   const itemsHtml = (order.items || [])
     .map(
@@ -2205,20 +2569,37 @@ const getPayLabel = (pm) => {
       </button>
 
       <div className="flex items-center gap-2 bg-slate-50 px-4 py-2 rounded-xl">
-  <span className="text-sm font-black text-slate-700">
-    خصم الكاش %
-  </span>
+  <span className="text-sm font-black text-slate-700">خصم الكاش %</span>
   <input
     type="number"
     min="0"
     max="100"
     value={cashDiscountPercent}
-    onChange={(e) =>
-      setCashDiscountPercent(Number(e.target.value || 0))
-    }
+    onChange={async (e) => {
+      const v = Math.min(100, Math.max(0, Number(e.target.value || 0)));
+      setCashDiscountPercent(v);
+      await setDoc(doc(db, ...financeDocPath), { cashDiscountPercent: v, updatedAt: Date.now() }, { merge: true });
+    }}
     className="w-20 p-2 rounded-lg border text-center font-black"
   />
 </div>
+
+<div className="flex items-center gap-2 bg-slate-50 px-4 py-2 rounded-xl">
+  <span className="text-sm font-black text-slate-700">{admT.taxPercent || "Tax %"}</span>
+  <input
+    type="number"
+    min="0"
+    max="100"
+    value={taxPercent}
+    onChange={async (e) => {
+      const v = Math.min(100, Math.max(0, Number(e.target.value || 0)));
+      setTaxPercent(v);
+      await setDoc(doc(db, ...financeDocPath), { taxPercent: v, updatedAt: Date.now() }, { merge: true });
+    }}
+    className="w-20 p-2 rounded-lg border text-center font-black"
+  />
+</div>
+
 
 
       {/* زر العميل الدائم */}
@@ -2314,6 +2695,18 @@ const getPayLabel = (pm) => {
         >
           🧺 المخزون
         </button>
+
+        <button
+  onClick={() => setAdminPage("finance")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "finance"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  💰 الإيرادات والإخراجات
+</button>
+
       </div>
     </aside>
 
@@ -2342,6 +2735,8 @@ const getPayLabel = (pm) => {
                   categoryAr: "",
                   categoryEn: "",
                   categoryTr: "",
+                  cost: 0,            // ✅ جديد
+  recipe: [],         // ✅ جديد: [{invId, invName, qty}]
                   price: 0,
                   image: "",
                   outOfStock: false,
@@ -2421,232 +2816,265 @@ const getPayLabel = (pm) => {
 
       {/* ============ ORDERS ============ */}
       {adminPage === "orders" && (
-        <div className="space-y-6">
-          <div className="flex items-center justify-between">
-            <h2 className="text-xl font-black">الطلبات</h2>
+  <div className="space-y-6">
+    <div className="flex items-center justify-between">
+      <h2 className="text-xl font-black">الطلبات</h2>
 
-            <div className="flex gap-2">
-              <button
-                onClick={() => setOrdersTab("active")}
-                className={`px-4 py-2 rounded-xl font-black ${
-                  ordersTab === "active"
-                    ? "bg-orange-600 text-white"
-                    : "bg-slate-100 text-slate-700"
-                }`}
-              >
-                الطلبات النشطة
-              </button>
+      <div className="flex gap-2">
+        <button
+          onClick={() => setOrdersTab("active")}
+          className={`px-4 py-2 rounded-xl font-black ${
+            ordersTab === "active"
+              ? "bg-orange-600 text-white"
+              : "bg-slate-100 text-slate-700"
+          }`}
+        >
+          الطلبات النشطة
+        </button>
 
-              <button
-                onClick={() => setOrdersTab("old")}
-                className={`px-4 py-2 rounded-xl font-black ${
-                  ordersTab === "old"
-                    ? "bg-orange-600 text-white"
-                    : "bg-slate-100 text-slate-700"
-                }`}
-              >
-                الطلبات القديمة
-              </button>
-            </div>
+        <button
+          onClick={() => setOrdersTab("old")}
+          className={`px-4 py-2 rounded-xl font-black ${
+            ordersTab === "old"
+              ? "bg-orange-600 text-white"
+              : "bg-slate-100 text-slate-700"
+          }`}
+        >
+          الطلبات القديمة
+        </button>
+      </div>
+    </div>
+
+    {/* ✅ فلتر الطلبات القديمة (دائماً ظاهر حتى لو لا يوجد طلبات) */}
+    {ordersTab === "old" && (
+      <div className="bg-white border rounded-2xl p-4">
+        <div className="font-black mb-3">فلترة الطلبات حسب التاريخ</div>
+
+        <div className="flex flex-wrap gap-3 items-end">
+          <div>
+            <div className="text-xs font-bold text-slate-500">من تاريخ</div>
+            <input
+              type="date"
+              value={oldFrom}
+              onChange={(e) => {
+                setOldFrom(e.target.value);
+                setOldFilterError("");
+              }}
+              className="border rounded-xl px-3 py-2"
+            />
           </div>
 
-          {(ordersTab === "active" ? activeOrders : oldOrders).length === 0 ? (
-            <div className="p-5 rounded-2xl bg-white border font-bold text-slate-500">
-              لا يوجد طلبات هنا
-            </div>
-          ) : (
-            <>
-              {/* فلتر الطلبات القديمة */}
-              {/* فلتر الطلبات القديمة – يجب أن يكون دائماً ظاهر */}
-{ordersTab === "old" && (
-  <div className="bg-white border rounded-2xl p-4">
-    <div className="font-black mb-3">فلترة الطلبات حسب التاريخ</div>
+          <div>
+            <div className="text-xs font-bold text-slate-500">إلى تاريخ</div>
+            <input
+              type="date"
+              value={oldTo}
+              onChange={(e) => {
+                setOldTo(e.target.value);
+                setOldFilterError("");
+              }}
+              className="border rounded-xl px-3 py-2"
+            />
+          </div>
 
-    <div className="flex flex-wrap gap-3 items-end">
-      <div>
-        <div className="text-xs font-bold text-slate-500">من تاريخ</div>
-        <input
-          type="date"
-          value={oldFrom}
-          onChange={(e) => setOldFrom(e.target.value)}
-          className="border rounded-xl px-3 py-2"
-        />
+          <button
+            type="button"
+            onClick={applyOldOrdersFilter}
+            className="bg-orange-600 text-white px-5 py-3 rounded-2xl font-black"
+          >
+            بحث
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setOldFrom("");
+              setOldTo("");
+              setApplyOldFilter(false);
+              setOldFilterError("");
+            }}
+            className="bg-slate-200 px-5 py-3 rounded-2xl font-black"
+          >
+            إلغاء
+          </button>
+        </div>
+
+        {/* رسالة خطأ التاريخ */}
+        {oldFilterError && (
+          <div className="mt-3 p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 font-black">
+            {oldFilterError}
+          </div>
+        )}
       </div>
-
-      <div>
-        <div className="text-xs font-bold text-slate-500">إلى تاريخ</div>
-        <input
-          type="date"
-          value={oldTo}
-          onChange={(e) => setOldTo(e.target.value)}
-          className="border rounded-xl px-3 py-2"
-        />
-      </div>
-
-      <button
-        type="button"
-        onClick={() => setApplyOldFilter(true)}
-        className="bg-orange-600 text-white px-5 py-3 rounded-2xl font-black"
-      >
-        بحث
-      </button>
-
-      <button
-        type="button"
-        onClick={() => {
-          setOldFrom("");
-          setOldTo("");
-          setApplyOldFilter(false);
-        }}
-        className="bg-slate-200 px-5 py-3 rounded-2xl font-black"
-      >
-        إلغاء
-      </button>
-    </div>
-  </div>
-)}
-
-
-              <div className="space-y-3">
-                {(ordersTab === "active" ? activeOrders : oldOrders).map((o) => (
-                  <div key={o.id} className="bg-white border rounded-2xl p-4">
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <div className="font-black text-slate-900">
-                          {o.table ? `المستلم/الطاولة: ${o.table}` : "طلب"}
-                        </div>
-                        <div className="text-xs font-bold text-slate-500 mt-1">
-                          {o.timestamp ? new Date(o.timestamp).toLocaleString() : ""}
-                        </div>
-
-                        
-{/* ✅ حالة الطلب + من قام به */}
-{o.status !== "new" && (
-  <div className="mt-2 flex flex-wrap gap-2">
-    <span
-      className={`px-3 py-1 rounded-full text-[11px] font-black ${
-        o.status === "prepared"
-          ? "bg-emerald-100 text-emerald-700"
-          : "bg-red-100 text-red-700"
-      }`}
-    >
-      {o.status === "prepared" ? "✅ تم التحضير" : "⛔ تم الإلغاء"}
-    </span>
-
-    {o.closedBy && (
-      <span className="px-3 py-1 rounded-full text-[11px] font-black bg-slate-100 text-slate-700">
-        👤 تم بواسطة: {o.closedBy}
-      </span>
     )}
 
-    {o.closedAt && (
-      <span className="px-3 py-1 rounded-full text-[11px] font-black bg-slate-100 text-slate-700">
-        🕒 وقت الإغلاق: {new Date(o.closedAt).toLocaleString()}
-      </span>
-    )}
-  </div>
-)}
+    {/* ✅ الآن عرض الطلبات أو رسالة فارغة */}
+    {listToShow.length === 0 ? (
+      <div className="p-5 rounded-2xl bg-white border font-bold text-slate-500">
+        لا يوجد طلبات هنا
+      </div>
+    ) : (
+      <div className="space-y-3">
+        {listToShow.map((o) => (
+          <div key={o.id} className="bg-white border rounded-2xl p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="font-black text-slate-900">
+                  {o.table ? `المستلم/الطاولة: ${o.table}` : "طلب"}
+                </div>
 
-                        <div className="mt-2 flex flex-wrap gap-2">
-                          <span className="px-3 py-1 rounded-full text-[11px] font-black bg-slate-100 text-slate-700">
-                            💳 الدفع: {getPayLabel(o.paymentMethod)}
-                          </span>
+                <div className="text-xs font-bold text-slate-500 mt-1">
+                  {o.timestamp ? new Date(o.timestamp).toLocaleString() : ""}
+                </div>
 
-                          {Number(o.discountPercent || 0) > 0 && (
-                            <span className="px-3 py-1 rounded-full text-[11px] font-black bg-orange-100 text-orange-700">
-                              🔻 خصم: {Number(o.discountPercent || 0)}%
-                            </span>
-                          )}
-                        </div>
-                      </div>
+                {/* ✅ حالة الطلب + من قام به */}
+                {o.status !== "new" && (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <span
+                      className={`px-3 py-1 rounded-full text-[11px] font-black ${
+                        o.status === "prepared"
+                          ? "bg-emerald-100 text-emerald-700"
+                          : "bg-red-100 text-red-700"
+                      }`}
+                    >
+                      {o.status === "prepared" ? "✅ تم التحضير" : "⛔ تم الإلغاء"}
+                    </span>
 
-                      <div className="font-black text-slate-900 text-right">
-                        {Number(o.discountPercent || 0) > 0 ? (
-                          <div className="space-y-1">
-                            <div className="text-sm text-slate-500 font-black">
-                              قبل الخصم: {Number(o.subtotal || 0).toFixed(2)} TL
-                            </div>
-                            <div className="text-sm text-orange-600 font-black">
-                              خصم ({Number(o.discountPercent || 0)}%): -
-                              {Number(o.discountAmount || 0).toFixed(2)} TL
-                            </div>
-                            <div className="text-lg text-slate-900 font-black">
-                              بعد الخصم: {Number(o.total || 0).toFixed(2)} TL
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="text-lg text-slate-900 font-black">
-                            الإجمالي: {Number(o.total || 0).toFixed(2)} TL
-                          </div>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="mt-3 space-y-1">
-                      {(o.items || []).map((it, idx) => (
-                        <div key={idx} className="text-sm font-bold text-slate-700">
-                          • {it.quantity}x {(it.nameAr || it.nameEn || it.nameTr || it.id)}
-                          {it.note ? (
-                            <span className="text-slate-500"> — 📝 {it.note}</span>
-                          ) : null}
-                        </div>
-                      ))}
-                    </div>
-
-                    {/* زر حذف الطلب (فقط في الطلبات القديمة) */}
-                    {ordersTab === "old" && (
-                      <button
-                        onClick={() => deleteOrderPermanently(o.id)}
-                        className="mt-3 bg-red-600 text-white px-4 py-2 rounded-2xl font-black hover:bg-red-500"
-                      >
-                        حذف الطلب
-                      </button>
+                    {o.closedBy && (
+                      <span className="px-3 py-1 rounded-full text-[11px] font-black bg-slate-100 text-slate-700">
+                        👤 تم بواسطة: {o.closedBy}
+                      </span>
                     )}
 
-                    {/* أزرار الإدارة للطلبات النشطة فقط */}
-                    {o.status === "new" && (
-                      <div className="mt-4 flex gap-2">
-                        <button
-                          onClick={() => markOrder(o.id, "prepared")}
-                          className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-black"
-                        >
-                          تم التحضير
-                        </button>
-
-                        <button
-                          onClick={() => markOrder(o.id, "cancelled")}
-                          className="px-4 py-2 rounded-xl bg-red-600 text-white font-black"
-                        >
-                          إلغاء
-                        </button>
-
-                        <button
-                          onClick={() => printInvoice(o)}
-                          className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
-                        >
-                          طباعة فاتورة
-                        </button>
-                      </div>
-                    )}
-
-                    {o.receiptDataUrl && (
-                      <button
-                        onClick={() => {
-                          setReceiptView(o.receiptDataUrl);
-                          setReceiptOpen(true);
-                        }}
-                        className="mt-3 px-4 py-2 rounded-xl bg-blue-600 text-white font-black"
-                      >
-                        عرض الإيصال
-                      </button>
+                    {o.closedAt && (
+                      <span className="px-3 py-1 rounded-full text-[11px] font-black bg-slate-100 text-slate-700">
+                        🕒 وقت الإغلاق: {new Date(o.closedAt).toLocaleString()}
+                      </span>
                     )}
                   </div>
-                ))}
+                )}
+
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <span className="px-3 py-1 rounded-full text-[11px] font-black bg-slate-100 text-slate-700">
+                    💳 الدفع: {getPayLabel(o.paymentMethod)}
+                  </span>
+
+                  {Number(o.discountPercent || 0) > 0 && (
+                    <span className="px-3 py-1 rounded-full text-[11px] font-black bg-orange-100 text-orange-700">
+                      🔻 خصم: {Number(o.discountPercent || 0)}%
+                    </span>
+                  )}
+                </div>
               </div>
-            </>
-          )}
-        </div>
-      )}
+
+              <div className="font-black text-slate-900 text-right space-y-1">
+
+  {/* قبل الخصم / بعد الخصم */}
+  {Number(o.discountPercent || 0) > 0 ? (
+    <>
+      <div className="text-sm text-slate-500 font-black">
+        قبل الخصم: {Number(o.subtotal || 0).toFixed(2)} TL
+      </div>
+
+      <div className="text-sm text-orange-600 font-black">
+        خصم ({Number(o.discountPercent || 0)}%): -
+        {Number(o.discountAmount || 0).toFixed(2)} TL
+      </div>
+
+      <div className="text-sm font-black">
+        بعد الخصم: {Number(o.total || 0).toFixed(2)} TL
+      </div>
+    </>
+  ) : (
+    <div className="text-sm font-black">
+      قبل الضريبة: {Number(o.total || 0).toFixed(2)} TL
+    </div>
+  )}
+
+  {/* ✅ الضريبة (مستقلة عن الخصم) */}
+  {Number(o.taxPercent || 0) > 0 && (
+    <>
+      <div className="text-sm text-blue-700 font-black">
+        ضريبة ({Number(o.taxPercent || 0)}%):
+        {Number(o.taxAmount || 0).toFixed(2)} TL
+      </div>
+
+      <div className="text-lg font-black text-slate-900">
+        الإجمالي بعد الضريبة:
+        {Number(o.totalWithTax || (Number(o.total || 0) + Number(o.taxAmount || 0))).toFixed(2)} TL
+      </div>
+    </>
+  )}
+
+</div>
+
+            </div>
+
+            <div className="mt-3 space-y-1">
+              {(o.items || []).map((it, idx) => (
+                <div key={idx} className="text-sm font-bold text-slate-700">
+                  • {it.quantity}x {(it.nameAr || it.nameEn || it.nameTr || it.id)}
+                  {it.note ? (
+                    <span className="text-slate-500"> — 📝 {it.note}</span>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+
+            {/* زر حذف الطلب (فقط في الطلبات القديمة) */}
+            {ordersTab === "old" && (
+              <button
+                onClick={() => deleteOrderPermanently(o.id)}
+                className="mt-3 bg-red-600 text-white px-4 py-2 rounded-2xl font-black hover:bg-red-500"
+              >
+                حذف الطلب
+              </button>
+            )}
+
+            {/* أزرار الإدارة للطلبات النشطة فقط */}
+            {o.status === "new" && (
+              <div className="mt-4 flex gap-2">
+                <button
+                  onClick={() => markOrder(o.id, "prepared")}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-black"
+                >
+                  تم التحضير
+                </button>
+
+                <button
+                  onClick={() => markOrder(o.id, "cancelled")}
+                  className="px-4 py-2 rounded-xl bg-red-600 text-white font-black"
+                >
+                  إلغاء
+                </button>
+
+                <button
+                  onClick={() => printInvoice(o)}
+                  className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
+                >
+                  طباعة فاتورة
+                </button>
+              </div>
+            )}
+
+            {o.receiptDataUrl && (
+              <button
+                onClick={() => {
+                  setReceiptView(o.receiptDataUrl);
+                  setReceiptOpen(true);
+                }}
+                className="mt-3 px-4 py-2 rounded-xl bg-blue-600 text-white font-black"
+              >
+                عرض الإيصال
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    )}
+  </div>
+)}
+
 
       {/* ============ INVENTORY ============ */}
       {adminPage === "inventory" && (
@@ -2769,9 +3197,145 @@ const getPayLabel = (pm) => {
                 ))}
               </div>
             )}
-          </div>
+          </div>         
         </div>
       )}
+
+
+      {adminPage === "finance" && (
+  <div className="space-y-6">
+
+<button
+  onClick={exportInventoryCSV}
+  className="bg-emerald-600 text-white px-5 py-3 rounded-xl font-black"
+>
+  تصدير المخزون إلى Excel
+</button>
+
+    
+    <div className="bg-white p-4 rounded-2xl border">
+  <h3 className="font-black mb-3">📦 إجمالي استخدام المخزون</h3>
+
+  <table className="w-full">
+    <thead>
+      <tr>
+        <th>المادة</th>
+        <th>الاستخدام</th>
+        <th>الوحدة</th>
+        <th>المتبقي</th>
+      </tr>
+    </thead>
+    <tbody>
+      {financeWithInventory.invRows.map((i) => (
+        <tr key={i.invId}>
+          <td className="font-black">{i.name}</td>
+          <td>{i.used}</td>
+          <td>{i.unit}</td>
+          <td>{i.currentQty}</td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+</div>
+
+    <h2 className="text-xl font-black">💰 الإيرادات والإخراجات</h2>
+
+    {/* الفلتر */}
+    <div className="bg-white p-4 rounded-2xl border flex gap-3 flex-wrap">
+      <button
+        onClick={() => setFinanceMode("daily")}
+        className={`px-4 py-2 rounded-xl font-black ${
+          financeMode === "daily" ? "bg-black text-white" : "bg-slate-100"
+        }`}
+      >
+        يومي
+      </button>
+
+      <button
+        onClick={() => setFinanceMode("range")}
+        className={`px-4 py-2 rounded-xl font-black ${
+          financeMode === "range" ? "bg-black text-white" : "bg-slate-100"
+        }`}
+      >
+        فترة
+      </button>
+
+      {financeMode === "daily" ? (
+        <input
+          type="date"
+          value={finDate}
+          onChange={(e) => setFinDate(e.target.value)}
+          className="border rounded-xl px-3 py-2"
+        />
+      ) : (
+        <>
+          <input
+            type="date"
+            value={finFrom}
+            onChange={(e) => setFinFrom(e.target.value)}
+            className="border rounded-xl px-3 py-2"
+          />
+          <input
+            type="date"
+            value={finTo}
+            onChange={(e) => setFinTo(e.target.value)}
+            className="border rounded-xl px-3 py-2"
+          />
+        </>
+      )}
+    </div>
+
+    {/* الإجمالي */}
+    <div className="bg-white p-4 rounded-2xl border font-black text-emerald-700 text-xl">
+      صافي الربح: {financeData.totalNet.toFixed(2)} TL
+    </div>
+
+    {/* الجدول */}
+    <div className="bg-white p-4 rounded-2xl border overflow-x-auto">
+  <table className="min-w-[1100px] w-full">
+    <thead>
+      <tr>
+        <th>المنتج</th>
+        <th>التكلفة</th>
+        <th>البيع</th>
+        <th>المباع</th>
+        <th>استهلاك المخزون</th> {/* ✅ جديد */}
+        <th>صافي الربح الاجمالي</th>
+      </tr>
+    </thead>
+    <tbody>
+      {financeWithInventory.rows.map((r) => (
+        <tr key={r.id} className="border-t align-top">
+          <td className="font-black">{r.name}</td>
+          <td>{r.cost}</td>
+          <td>{r.sell}</td>
+          <td>{r.soldQty}</td>
+
+          {/* ✅ الاستهلاك لكل منتج */}
+          <td className="text-sm">
+            {(!r.usage || r.usage.length === 0) ? (
+              <span className="text-slate-400 font-bold">-</span>
+            ) : (
+              <div className="space-y-1">
+                {r.usage.map((u) => (
+                  <div key={u.invId} className="font-bold text-slate-700">
+                    • {u.invName}: {u.used} {u.unit}
+                  </div>
+                ))}
+              </div>
+            )}
+          </td>
+
+          <td className="text-emerald-700 font-black">
+            {Number(r.netTotal || 0).toFixed(2)}
+          </td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+</div>
+  </div>
+)}
     </section>
   </div>
 </main>
@@ -3646,6 +4210,20 @@ setCreateOrderError("");
                   className="p-4 rounded-2xl border font-black"
                 />
 
+                <input
+  type="number"
+  placeholder="تكلفة المنتج"
+  value={editingItem.cost ?? ""}
+  onChange={(e) =>
+    setEditingItem({
+      ...editingItem,
+      cost: Number(e.target.value || 0),
+    })
+  }
+  className="p-4 rounded-2xl border font-black"
+/>
+
+
                 {/* السعر القديم */}
 <input
   type="number"
@@ -3964,6 +4542,16 @@ setCreateOrderError("");
     );
   }
 
+  const cartSubtotal = cart.reduce(
+  (s, i) => s + (i.price || 0) * (i.quantity || 1),
+  0
+);
+
+const cartTaxP = Math.min(100, Math.max(0, Number(taxPercent || 0)));
+const cartTaxAmount = (cartSubtotal * cartTaxP) / 100;
+const cartTotalWithTax = cartSubtotal + cartTaxAmount;
+
+
   /* ==========================================================
      4) CUSTOMER MENU
      ========================================================== */
@@ -4129,11 +4717,12 @@ setCreateOrderError("");
         {t.notes}
       </label>
       <textarea
-        value={notesText}
-        onChange={(e) => setNotesText(e.target.value)}
-        placeholder={t.notesPlaceholder}
-        className="w-full p-4 rounded-2xl border h-28"
-      />
+  value={notesText}
+  onChange={(e) => setNotesText(e.target.value)}
+  placeholder={t.notesPlaceholder || "مثال: بدون بصل / صوص زيادة..."}
+  className="w-full p-4 rounded-2xl border bg-slate-50 outline-none font-bold text-slate-800 h-28"
+ />
+
 
       <div className="mt-5 grid grid-cols-2 gap-3">
         <button
@@ -4318,10 +4907,26 @@ setCreateOrderError("");
                 <div className="p-10 bg-slate-50 border-t space-y-6">
                   <div className="flex justify-between items-center">
                     <span className="text-slate-400 font-bold">{t.total}</span>
-                    <span className="text-3xl font-black text-slate-950">
-                      {cart.reduce((s, i) => s + (i.price || 0) * (i.quantity || 1), 0)}{" "}
-                      <small className="text-sm">TL</small>
-                    </span>
+                    <div className="space-y-2">
+  <div className="flex justify-between">
+    <span>{cartSubtotal.toFixed(2)} TL</span>
+  </div>
+
+  {cartTaxP > 0 && (
+    <>
+      <div className="flex justify-between">
+        <span>ضريبة ({cartTaxP}%)</span>
+        <span>{cartTaxAmount.toFixed(2)} TL</span>
+      </div>
+
+      <div className="flex justify-between font-black text-xl">
+        <span>الإجمالي</span>
+        <span>{cartTotalWithTax.toFixed(2)} TL</span>
+      </div>
+    </>
+  )}
+</div>
+
                   </div>
 
                   <button
@@ -4341,8 +4946,15 @@ setCreateOrderError("");
       {
         table,
         items,
-        total,
+         total: cartSubtotal,
+          taxPercent: cartTaxP,
+  taxAmount: cartTaxAmount,
+  totalWithTax: cartTotalWithTax,
+
         paymentMethod,
+        status: "new",
+  timestamp: Date.now(),
+
         receiptDataUrl: paymentMethod === "iban" ? receiptDataUrl : "",
         ibanName: paymentMethod === "iban" ? "wingi" : "",
         ibanNumber:
