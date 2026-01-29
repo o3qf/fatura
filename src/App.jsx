@@ -389,6 +389,34 @@ export default function App() {
      - الإدارة + Portal: "/admin"
      ========================= */
   
+// ===== Branches (NEW) =====
+const [branches, setBranches] = useState([]);
+const [branchId, setBranchId] = useState("");
+const [branchPick, setBranchPick] = useState("");
+
+
+// ===== Branch Helpers =====
+const branchRoot = useMemo(() => {
+  return branchId
+    ? ["artifacts", appId, "public", "data", "branches", branchId]
+    : null;
+}, [branchId, appId]);
+
+const colRef = (name) => {
+  if (!branchRoot) {
+    return collection(db, "artifacts", appId, "public", "data", name);
+  }
+  return collection(db, ...branchRoot, name);
+};
+
+const docRef = (name, id) => {
+  if (!branchRoot) {
+    return doc(db, "artifacts", appId, "public", "data", name, id);
+  }
+  return doc(db, ...branchRoot, name, id);
+};
+
+
 
   // portal لا يظهر للعميل (العميل يدخل مباشرة الاختيار)
   const path = typeof window !== "undefined" ? window.location.pathname : "/";
@@ -572,6 +600,8 @@ const [oldFrom, setOldFrom] = useState(""); // تاريخ البداية
 const [oldTo, setOldTo] = useState("");     // تاريخ النهاية
 
 
+
+
 // ===== تحويل تاريخ الطلب إلى Date (مهم لفلترة الطلبات القديمة) =====
 const orderDateToJS = (o) => {
   const v = o?.createdAt ?? o?.timestamp ?? o?.date ?? o?.time;
@@ -611,14 +641,42 @@ const [oldFilterError, setOldFilterError] = useState("");
 
 
 const [orders, setOrders] = useState([]);
+// ===== تقسيم المخزون =====
+
 
 console.log("APP ID =", appId, "MENU =", menuItems.length);
 
-// ✅ Inventory
+// ✅ Inventory 
 const [inventory, setInventory] = useState([]);
 
+// ===== هدر (Waste Logs) =====
+const [wasteLogs, setWasteLogs] = useState([]);
+
+useEffect(() => {
+  const ref = collection(db, "artifacts", appId, "public", "data", "wasteLogs");
+  return onSnapshot(ref, (snap) => {
+    const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() })); // ✅ هنا الإصلاح
+    setWasteLogs(arr);
+  });
+}, [appId]);
+
+
+
+
+const activeInventory = useMemo(
+  () => (inventory || []).filter((x) => !x.isWaste),
+  [inventory]
+);
+
+const wasteInventory = useMemo(
+  () => (inventory || []).filter((x) => !!x.isWaste),
+  [inventory]
+);
+
+
 const computedOutOfStock = useMemo(() => {
-  const invMap = new Map(inventory.map((x) => [x.id, x]));
+ const invMap = new Map(activeInventory.map((x) => [x.id, x])); // ✅ فقط المخزون
+
 
   const orderDateToJS = (createdAt) => {
   if (!createdAt) return null;
@@ -750,6 +808,7 @@ const [vipEdit, setVipEdit] = useState(null); // وضع التعديل
 // داخل create order
 const [vipPickerOpen, setVipPickerOpen] = useState(false);
 const [selectedVip, setSelectedVip] = useState(null);
+
 
 
 
@@ -1072,7 +1131,8 @@ const adminTotal = useMemo(() => {
      const unsubInv = onSnapshot(
     collection(db, "artifacts", appId, "public", "data", "inventory"),
     (snap) => {
-      setInventory(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      setInventory(snap.docs.map((d) => ({ id: d.id, ...d.data(),
+    isWaste: !!d.data().isWaste, })));
     }
   );
     return () => {
@@ -1081,6 +1141,26 @@ const adminTotal = useMemo(() => {
        unsubInv();
     };
   }, [user]);
+
+  // ===== Fetch Branches =====
+useEffect(() => {
+  if (!user) return;
+
+  const ref = collection(
+    db,
+    "artifacts",
+    appId,
+    "public",
+    "data",
+    "branches"
+  );
+
+  return onSnapshot(ref, (snap) => {
+    const arr = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    setBranches(arr);
+  });
+}, [user, appId]);
+
 
   const refreshOutOfStockForAllMenu = async () => {
     
@@ -1396,6 +1476,23 @@ useEffect(() => {
   };
 }, [orders, menuItems, financeMode, finDate, finFrom, finTo]);
 
+
+// ===== فلترة الهدر حسب فترة finance =====
+const filteredWasteLogs = useMemo(() => {
+  return (wasteLogs || []).filter((w) =>
+    inFinanceRange({ timestamp: w.timestamp })
+  );
+}, [wasteLogs, financeMode, finDate, finFrom, finTo]);
+
+const wasteTotal = useMemo(() => {
+  return filteredWasteLogs.reduce(
+    (s, w) => s + Number(w.totalCost || 0),
+    0
+  );
+}, [filteredWasteLogs]);
+
+
+
 const financeWithInventory = useMemo(() => {
   // ✅ فلترة الطلبات حسب التاريخ + (اختياري) حسب الحالة
   const filteredOrders = (orders || []).filter((o) => {
@@ -1408,6 +1505,8 @@ const financeWithInventory = useMemo(() => {
     return true;
   });
 
+ 
+
   // مباع لكل منتج
   const soldMap = new Map(); // menuId -> qty
   filteredOrders.forEach((o) => {
@@ -1418,8 +1517,10 @@ const financeWithInventory = useMemo(() => {
   });
 
   // خرائط للمخزون
-  const invMap = new Map(inventory.map((x) => [x.id, x])); // invId -> invObj
+  const invMap = new Map(activeInventory.map((x) => [x.id, x])); // invId -> invObj
 
+
+  
   // ✅ إجمالي الاستهلاك لكل عنصر مخزون عبر كل المنتجات
   const invUsageTotalMap = new Map(); // invId -> usedQty
 
@@ -1438,6 +1539,7 @@ const financeWithInventory = useMemo(() => {
         const needForOne = Number(ing.amountPerOne || 0);
         if (!invId || needForOne <= 0 || soldQty <= 0) return null;
 
+        
         const inv = invMap.get(invId);
         if (!inv || inv.unit === "none") return null;
 
@@ -1485,11 +1587,16 @@ const financeWithInventory = useMemo(() => {
     invRows,
     totalNet: rows.reduce((s, r) => s + Number(r.netTotal || 0), 0),
   };
-}, [orders, menuItems, inventory, financeMode, finDate, finFrom, finTo]);
+}, [orders, activeInventory, menuItems, financeMode, finDate, finFrom, finTo]);
+
 
 
   const inventoryAlerts = useMemo(() => {
-  const invMap = new Map(inventory.map((x) => [x.id, x]));
+const invMap = new Map((inventory || []).map((x) => [x.id, x])); // ✅ يشمل الهدر كمان
+
+
+
+  
   const usedInv = new Map(); // invId -> أقل كمية لصنع منتج واحد
 
   // نجمع أقل amountPerOne لكل عنصر مخزون (يعني: أقل كمية يحتاجها منتج واحد)
@@ -1597,6 +1704,7 @@ const financeWithInventory = useMemo(() => {
     }
 
     // ✅ prepared: خصم المخزون + تحديث الطلب داخل Transaction
+    const activeInvMap = new Map(activeInventory.map((x) => [x.id, x]));
     await runTransaction(db, async (tx) => {
       const orderSnap = await tx.get(orderRef);
       if (!orderSnap.exists()) throw new Error("Order not found");
@@ -1641,8 +1749,14 @@ const financeWithInventory = useMemo(() => {
         
         for (const ing of recipe) {
           const invId = ing.invId;
-          const invObj = inventory.find((x) => x.id === invId);
-if (invObj?.unit === "none") continue;
+          const invObj = activeInvMap.get(invId);
+
+// ✅ إذا العنصر غير موجود في المخزون الفعّال => يعني "هدر" أو محذوف => تجاهله
+if (!invObj) continue;
+
+// ✅ عناصر "none" لا تُخصم
+if (invObj.unit === "none") continue;
+
 
 
           const needForOne = Number(ing.amountPerOne || 0);
@@ -1673,6 +1787,7 @@ deductionMap.set(invId, rec);
      // 2) ✅ لازم نقرأ كل المخزون أولاً (بدون أي كتابة)
 const invReads = [];
 for (const [invId, info] of deductionMap.entries()) {
+  if (!activeInvMap.has(invId)) continue;
   const totalNeed = info.totalNeed;
   const reason = info.reasons?.[0];
 
@@ -2196,6 +2311,14 @@ const adminLogin = async () => {
   setAdminAuthError("");
   setIsOwner(false);
 
+
+   // ✅ تحقق اختيار الفرع
+  if (!branchPick) {
+    setAdminAuthError("اختر الفرع أولاً");
+    return;
+  }
+
+
   if (!adminUsername || !adminPassword) {
     setAdminAuthError(admT.requiredFields);
     return;
@@ -2224,18 +2347,24 @@ const adminLogin = async () => {
     const ownerP = normalizeDigits(owner.ownerPassword || "12344321").trim();
 
     // ✅ Owner login
-    if (u === ownerU) {
-      if (p !== ownerP) {
-        setAdminAuthError(admT.invalidCredentials);
-        return;
-      }
+if (u === ownerU) {
+  if (p !== ownerP) {
+    setAdminAuthError(admT.invalidCredentials);
+    return;
+  }
 
-      const session = { username: ownerU, role: "owner" };
-      setAdminSession(session);
-      setIsOwner(true);
-      localStorage.setItem("wingi_admin_session", JSON.stringify(session));
-      return;
-    }
+  const session = { username: ownerU, role: "owner" };
+  setAdminSession(session);
+  setIsOwner(true);
+
+  // ✅ حفظ الفرع
+  setBranchId(branchPick);
+  localStorage.setItem("wingi_branch_id", branchPick);
+
+  localStorage.setItem("wingi_admin_session", JSON.stringify(session));
+  return;
+}
+
 
     // ✅ Staff login
     const staffRef = doc(db, ...adminUsersColPath, u);
@@ -2252,10 +2381,17 @@ const adminLogin = async () => {
       return;
     }
 
-    const session = { username: u, role: "staff" };
-    setAdminSession(session);
-    setIsOwner(false);
-    localStorage.setItem("wingi_admin_session", JSON.stringify(session));
+    // ✅ Staff login
+const session = { username: u, role: "staff" };
+setAdminSession(session);
+setIsOwner(false);
+
+// ✅ حفظ الفرع
+setBranchId(branchPick);
+localStorage.setItem("wingi_branch_id", branchPick);
+
+localStorage.setItem("wingi_admin_session", JSON.stringify(session));
+
   } catch (e) {
     console.error(e);
     setAdminAuthError("Error");
@@ -2454,7 +2590,49 @@ const getPayLabel = (pm) => {
               {adminAuthMode === "login" ? admT.adminLogin : admT.adminRegister}
             </h2>
 
-            <div className="space-y-3 mt-6">
+           <div className="space-y-3 mt-6">
+
+  {/* ✅ اختيار الفرع */}
+  <select
+    value={branchPick}
+    onChange={(e) => setBranchPick(e.target.value)}
+    className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white font-black"
+  >
+    <option value="">اختر الفرع</option>
+    {branches.map((b) => (
+      <option key={b.id} value={b.id}>
+        {b.name || b.id}
+      </option>
+    ))}
+  </select>
+
+  {/* اسم المستخدم */}
+  <input
+    value={adminUsername}
+    onChange={(e) => setAdminUsername(e.target.value)}
+    placeholder={admT.username}
+    className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
+  />
+
+  {/* كلمة المرور */}
+  <input
+    value={adminPassword}
+    onChange={(e) => setAdminPassword(e.target.value)}
+    placeholder={admT.password}
+    type="password"
+    className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
+  />
+
+  {adminAuthMode === "register" && (
+    <input
+      value={ownerPin}
+      onChange={(e) => setOwnerPin(e.target.value)}
+      placeholder={admT.ownerPin}
+      type="password"
+      className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
+    />
+  )}
+
               <input
                 value={adminUsername}
                 onChange={(e) => setAdminUsername(e.target.value)}
@@ -2475,7 +2653,7 @@ const getPayLabel = (pm) => {
                 <input
                   value={ownerPin}
                   onChange={(e) => setOwnerPin(e.target.value)}
-                  placeholder={admT.ownerPin}
+                  placeholder={admT.ownerPin || "كلمة مرور صاحب المطعم الحالية"}
                   type="password"
                   className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
                 />
@@ -3081,6 +3259,47 @@ const getPayLabel = (pm) => {
         <div className="space-y-6">
           <h2 className="text-xl font-black">المخزون</h2>
 
+
+<div className="bg-white p-4 rounded-2xl border">
+  <h3 className="font-black mb-3">🗑️ الهدر</h3>
+
+  {wasteInventory.length === 0 ? (
+    <div className="p-4 rounded-2xl bg-slate-50 text-slate-500 font-bold">
+      لا يوجد عناصر هدر
+    </div>
+  ) : (
+    <div className="space-y-2">
+      {wasteInventory.map((inv) => (
+        <div
+          key={inv.id}
+          className="p-4 rounded-2xl border flex justify-between items-center"
+        >
+          <div>
+            <div className="font-black">{inv.name}</div>
+            <div className="text-xs text-slate-500 font-bold">
+              آخر كمية: {inv.quantity} {inv.unit}
+            </div>
+          </div>
+
+          <button
+            onClick={async () => {
+              const ok = confirm("حذف نهائي من الهدر؟");
+              if (!ok) return;
+
+              await deleteDoc(
+                doc(db, "artifacts", appId, "public", "data", "inventory", inv.id)
+              );
+            }}
+            className="px-4 py-2 rounded-xl bg-red-600 text-white font-black hover:bg-red-500"
+          >
+            حذف
+          </button>
+        </div>
+      ))}
+    </div>
+  )}
+</div>
+
           {/* نموذج الإضافة */}
           <div className="bg-white p-4 rounded-2xl border space-y-3">
             <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
@@ -3156,7 +3375,7 @@ const getPayLabel = (pm) => {
               </div>
             ) : (
               <div className="space-y-2">
-                {inventory.map((inv) => (
+                {activeInventory.map((inv) => (
                   <div
                     key={inv.id}
                     className="p-4 rounded-2xl border flex justify-between items-center"
@@ -3167,6 +3386,57 @@ const getPayLabel = (pm) => {
                     >
                       تعديل
                     </button>
+
+
+                    <button
+  onClick={async () => {
+    const ok = confirm("تحويل هذا العنصر إلى الهدر؟");
+    if (!ok) return;
+
+    try {
+      await runTransaction(db, async (tx) => {
+        const invRef = doc(db, "artifacts", appId, "public", "data", "inventory", inv.id);
+        const snap = await tx.get(invRef);
+        if (!snap.exists()) return;
+
+        const data = snap.data() || {};
+        const qty = Number(data.quantity || 0);
+        const unit = data.unit || "none";
+
+        // ✅ انت تستخدم costPrice بالمخزون
+        const costPerUnit = Number(data.costPrice || 0);
+        const totalCost = qty * costPerUnit;
+
+        // 1) علّم العنصر أنه هدر
+        tx.set(invRef, { isWaste: true, wasteAt: Date.now() }, { merge: true });
+
+        // 2) سجل الهدر بالتاريخ داخل wasteLogs
+        const logRef = doc(
+          collection(db, "artifacts", appId, "public", "data", "wasteLogs")
+        );
+
+        tx.set(logRef, {
+          invId: inv.id,
+          name: data.name || inv.name || inv.id,
+          qty,
+          unit,
+          costPerUnit,
+          totalCost,
+          timestamp: Date.now(),
+          createdBy: adminSession?.username || "unknown",
+        });
+      });
+    } catch (e) {
+      console.error(e);
+      alert("فشل تحويل للهدر");
+    }
+  }}
+  className="px-4 py-2 rounded-xl bg-amber-100 text-amber-800 font-black"
+>
+  الهدر
+</button>
+
+
 
                     <div>
                       <div className="font-black">{inv.name}</div>
@@ -3212,8 +3482,30 @@ const getPayLabel = (pm) => {
   تصدير المخزون إلى Excel
 </button>
 
-    
-    <div className="bg-white p-4 rounded-2xl border">
+    <h2 className="text-xl font-black">💰 الإيرادات والإخراجات</h2>
+
+    {/* الفلتر */}
+    <div className="bg-white p-4 rounded-2xl border flex gap-3 flex-wrap">
+      <button
+        onClick={() => setFinanceMode("daily")}
+        className={`px-4 py-2 rounded-xl font-black ${
+          financeMode === "daily" ? "bg-black text-white" : "bg-slate-100"
+        }`}
+      >
+        يومي
+      </button>
+
+      <button
+        onClick={() => setFinanceMode("range")}
+        className={`px-4 py-2 rounded-xl font-black ${
+          financeMode === "range" ? "bg-black text-white" : "bg-slate-100"
+        }`}
+      >
+        فترة
+      </button>
+
+
+<div className="bg-white p-4 rounded-2xl border">
   <h3 className="font-black mb-3">📦 إجمالي استخدام المخزون</h3>
 
   <table className="w-full">
@@ -3238,51 +3530,80 @@ const getPayLabel = (pm) => {
   </table>
 </div>
 
-    <h2 className="text-xl font-black">💰 الإيرادات والإخراجات</h2>
 
-    {/* الفلتر */}
-    <div className="bg-white p-4 rounded-2xl border flex gap-3 flex-wrap">
-      <button
-        onClick={() => setFinanceMode("daily")}
-        className={`px-4 py-2 rounded-xl font-black ${
-          financeMode === "daily" ? "bg-black text-white" : "bg-slate-100"
-        }`}
-      >
-        يومي
-      </button>
 
-      <button
-        onClick={() => setFinanceMode("range")}
-        className={`px-4 py-2 rounded-xl font-black ${
-          financeMode === "range" ? "bg-black text-white" : "bg-slate-100"
-        }`}
-      >
-        فترة
-      </button>
+{/* 🗑️ الهدر */}
+<div className="bg-white p-4 rounded-2xl border">
+  <div className="flex items-center justify-between mb-3">
+    <h3 className="font-black">🗑️ الهدر (حسب التاريخ)</h3>
+    <div className="font-black text-red-600">
+      إجمالي الهدر: {wasteTotal.toFixed(2)} TL
+    </div>
+  </div>
+
+  {filteredWasteLogs.length === 0 ? (
+    <div className="p-4 rounded-2xl bg-slate-50 text-slate-500 font-bold">
+      لا يوجد هدر في هذه الفترة
+    </div>
+  ) : (
+    <div className="space-y-2">
+      {filteredWasteLogs.map((w) => (
+        <div
+          key={w.id}
+          className="p-4 rounded-2xl border flex justify-between items-center"
+        >
+          <div>
+            <div className="font-black">{w.name}</div>
+            <div className="text-xs text-slate-500 font-bold">
+              الكمية: {w.qty} {w.unit} — التكلفة:{" "}
+              {Number(w.totalCost || 0).toFixed(2)} TL
+            </div>
+            <div className="text-xs text-slate-400 font-bold">
+              {w.timestamp
+                ? new Date(w.timestamp).toLocaleString()
+                : ""}
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+</div>
 
       {financeMode === "daily" ? (
-        <input
-          type="date"
-          value={finDate}
-          onChange={(e) => setFinDate(e.target.value)}
-          className="border rounded-xl px-3 py-2"
-        />
-      ) : (
-        <>
-          <input
-            type="date"
-            value={finFrom}
-            onChange={(e) => setFinFrom(e.target.value)}
-            className="border rounded-xl px-3 py-2"
-          />
-          <input
-            type="date"
-            value={finTo}
-            onChange={(e) => setFinTo(e.target.value)}
-            className="border rounded-xl px-3 py-2"
-          />
-        </>
-      )}
+  <div>
+    <div className="text-xs font-black text-slate-500 mb-1">التاريخ</div>
+    <input
+      type="date"
+      value={finDate}
+      onChange={(e) => setFinDate(e.target.value)}
+      className="border rounded-xl px-3 py-2"
+    />
+  </div>
+) : (
+  <>
+    <div>
+      <div className="text-xs font-black text-slate-500 mb-1">من تاريخ</div>
+      <input
+        type="date"
+        value={finFrom}
+        onChange={(e) => setFinFrom(e.target.value)}
+        className="border rounded-xl px-3 py-2"
+      />
+    </div>
+
+    <div>
+      <div className="text-xs font-black text-slate-500 mb-1">إلى تاريخ</div>
+      <input
+        type="date"
+        value={finTo}
+        onChange={(e) => setFinTo(e.target.value)}
+        className="border rounded-xl px-3 py-2"
+      />
+    </div>
+  </>
+)}
+
     </div>
 
     {/* الإجمالي */}
@@ -3706,7 +4027,7 @@ const getPayLabel = (pm) => {
                     className="w-28 p-2 rounded-xl border text-center font-black"
                   />
                   <div className="text-xs font-bold text-slate-500">
-                    {invNewUnit === "kg" ? invNewLinksInputUnit : invNewUnit === "liter" ? invNewLinksInputUnit : "pcs"}
+                    {invNewUnit === "g" ? "g" : invNewUnit === "ml" ? "ml" : "pcs"}
                   </div>
                 </div>
               </div>
