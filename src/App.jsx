@@ -390,9 +390,19 @@ export default function App() {
      ========================= */
   
 // ===== Branches (NEW) =====
-const [branches, setBranches] = useState([]);
 const [branchId, setBranchId] = useState("");
 const [branchPick, setBranchPick] = useState("");
+
+
+
+
+
+
+// ===== Branches UI State =====
+const [branches, setBranches] = useState([]);
+const [newBranchName, setNewBranchName] = useState("");
+const [showBranchPicker, setShowBranchPicker] = useState(false);
+
 
 
 // ===== Branch Helpers =====
@@ -401,6 +411,7 @@ const branchRoot = useMemo(() => {
     ? ["artifacts", appId, "public", "data", "branches", branchId]
     : null;
 }, [branchId, appId]);
+
 
 const colRef = (name) => {
   if (!branchRoot) {
@@ -551,6 +562,16 @@ const applyOldOrdersFilter = () => {
 
 
 
+
+// ✅ العميل يحدد الفرع من الرابط: ?branch=BRANCH_ID
+useEffect(() => {
+  if (typeof window === "undefined") return;
+  const params = new URLSearchParams(window.location.search);
+  const b = params.get("branch");
+  if (b) setBranchId(b);
+}, []);
+
+
 // 5B: restore admin session
 useEffect(() => {
   if (typeof window === "undefined") return;
@@ -584,6 +605,8 @@ useEffect(() => {
 
   const [user, setUser] = useState(null);
 
+
+  
   // Customer language
   const [lang, setLang] = useState("ar");
   // Admin language
@@ -659,6 +682,8 @@ useEffect(() => {
     setWasteLogs(arr);
   });
 }, [appId]);
+
+
 
 
 
@@ -1118,8 +1143,9 @@ const adminTotal = useMemo(() => {
       }
     );
 
+
     const unsubOrders = onSnapshot(
-      collection(db, "artifacts", appId, "public", "data", "orders"),
+      colRef("orders"),
       (snap) => {
         const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
         // newest first
@@ -1142,24 +1168,18 @@ const adminTotal = useMemo(() => {
     };
   }, [user]);
 
-  // ===== Fetch Branches =====
+
+
+// ✅ جلب الفروع (دائمًا من المسار الرئيسي - ليس داخل فرع)
 useEffect(() => {
-  if (!user) return;
-
-  const ref = collection(
-    db,
-    "artifacts",
-    appId,
-    "public",
-    "data",
-    "branches"
-  );
-
+  const ref = collection(db, "artifacts", appId, "public", "data", "branches");
   return onSnapshot(ref, (snap) => {
-    const arr = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    arr.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
     setBranches(arr);
   });
-}, [user, appId]);
+}, [appId]);
+
 
 
   const refreshOutOfStockForAllMenu = async () => {
@@ -2116,7 +2136,7 @@ const totalWithTax = total + taxAmount;
 
     
 
-    await addDoc(collection(db, "artifacts", appId, "public", "data", "orders"), {
+    await addDoc(colRef("orders"), {
       table: orderTable,
       items,
       subtotal,
@@ -2135,6 +2155,7 @@ const totalWithTax = total + taxAmount;
   paymentMethod: orderPay,
   status: "new",
   timestamp: Date.now(),
+    branchId: branchId || "",
     });
 
     // reset
@@ -2312,11 +2333,21 @@ const adminLogin = async () => {
   setIsOwner(false);
 
 
-   // ✅ تحقق اختيار الفرع
-  if (!branchPick) {
-    setAdminAuthError("اختر الفرع أولاً");
-    return;
-  }
+ // ✅ إذا ما فيه فروع أصلاً لا تجبره يختار
+if (branches.length > 0 && !branchPick) {
+  setAdminAuthError("اختر الفرع أولاً");
+  return;
+}
+
+
+if (branchPick) {
+  setBranchId(branchPick);
+  localStorage.setItem("wingi_branch_id", branchPick);
+} else {
+  setBranchId(""); // النظام القديم بدون فروع
+  localStorage.removeItem("wingi_branch_id");
+}
+
 
 
   if (!adminUsername || !adminPassword) {
@@ -2633,32 +2664,7 @@ const getPayLabel = (pm) => {
     />
   )}
 
-              <input
-                value={adminUsername}
-                onChange={(e) => setAdminUsername(e.target.value)}
-                placeholder={admT.username}
-                className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
-              />
-
-              <input
-                value={adminPassword}
-                onChange={(e) => setAdminPassword(e.target.value)}
-                placeholder={admT.password}
-                type="password"
-                className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
-              />
-
-
-              {adminAuthMode === "register" && (
-                <input
-                  value={ownerPin}
-                  onChange={(e) => setOwnerPin(e.target.value)}
-                  placeholder={admT.ownerPin || "كلمة مرور صاحب المطعم الحالية"}
-                  type="password"
-                  className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
-                />
-              )}
-
+              
               {adminAuthError && (
                 <div className="bg-red-500/20 border border-red-500/30 text-red-100 p-3 rounded-2xl text-sm font-bold">
                   {adminAuthError}
@@ -2834,6 +2840,43 @@ const getPayLabel = (pm) => {
    <main className="p-6 max-w-[1900px] mx-auto w-full">
   <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
 
+
+
+
+
+{/* ✅ Branch Picker للأدمن */}
+{appMode === "admin" && adminSession && branches.length > 0 && !branchId && (
+  <div className="fixed inset-0 bg-black/40 z-[200] flex items-center justify-center p-4">
+    <div className="bg-white w-full max-w-md rounded-3xl p-6 border">
+      <div className="text-xl font-black mb-2">اختر الفرع</div>
+      <div className="text-sm text-slate-600 mb-4">
+        المينيو مشترك، لكن الطلبات/المخزون/الإيرادات ستكون منفصلة لكل فرع.
+      </div>
+
+      <select
+        className="w-full border rounded-2xl p-3 font-bold"
+        defaultValue=""
+        onChange={(e) => setBranchId(e.target.value)}
+      >
+        <option value="">(بدون فرع - النظام القديم)</option>
+        {branches.map((b) => (
+          <option key={b.id} value={b.id}>
+            {b.name}
+          </option>
+        ))}
+      </select>
+
+      <button
+        className="w-full mt-4 bg-slate-950 text-white py-3 rounded-2xl font-black"
+        onClick={() => setShowBranchPicker(false)}
+      >
+        دخول
+      </button>
+    </div>
+  </div>
+)}
+
+
     {/* ===== SIDEBAR ===== */}
     <aside className="xl:col-span-3">
       <div className="bg-white rounded-[2rem] border p-4 sticky top-[92px]">
@@ -2881,8 +2924,24 @@ const getPayLabel = (pm) => {
       ? "bg-slate-950 text-white"
       : "bg-slate-50 text-slate-700"
   }`}
+
+
 >
+
+  
   💰 الإيرادات والإخراجات
+</button>
+
+
+<button
+  onClick={() => setAdminPage("branches")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "branches"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  🏪 الفروع
 </button>
 
       </div>
@@ -2890,6 +2949,83 @@ const getPayLabel = (pm) => {
 
     {/* ===== CONTENT ===== */}
     <section className="xl:col-span-9 space-y-6">
+
+
+
+{adminPage === "branches" && (
+  <div className="space-y-6">
+    <h2 className="text-xl font-black">🏪 الفروع</h2>
+
+    <div className="bg-white p-4 rounded-2xl border space-y-3">
+      <div className="font-black">إضافة فرع جديد</div>
+      <div className="flex gap-3">
+        <input
+          value={newBranchName}
+          onChange={(e) => setNewBranchName(e.target.value)}
+          className="flex-grow border rounded-2xl p-3 font-bold"
+          placeholder="اسم الفرع (مثال: فرع الفاتح)"
+        />
+        <button
+          className="bg-slate-950 text-white px-5 rounded-2xl font-black"
+          onClick={async () => {
+            const name = (newBranchName || "").trim();
+            if (!name) return;
+            await addDoc(
+              collection(db, "artifacts", appId, "public", "data", "branches"),
+              { name, createdAt: Date.now() }
+            );
+            setNewBranchName("");
+          }}
+        >
+          إضافة
+        </button>
+      </div>
+    </div>
+
+    <div className="bg-white p-4 rounded-2xl border">
+      <div className="font-black mb-3">قائمة الفروع</div>
+
+      {branches.length === 0 ? (
+        <div className="text-slate-500 font-bold">لا يوجد فروع.</div>
+      ) : (
+        <div className="space-y-3">
+          {branches.map((b) => (
+            <div
+              key={b.id}
+              className="flex items-center justify-between border rounded-2xl p-3"
+            >
+              <div className="font-black">{b.name}</div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  className={`px-4 py-2 rounded-xl font-black ${
+                    branchId === b.id ? "bg-emerald-600 text-white" : "bg-slate-100"
+                  }`}
+                  onClick={() => setBranchId(b.id)}
+                >
+                  اختيار
+                </button>
+
+                <button
+                  className="px-4 py-2 rounded-xl font-black bg-rose-600 text-white"
+                  onClick={async () => {
+                    // حذف الفرع (ملاحظة: لن يحذف بياناته الفرعية تلقائيًا)
+                    await deleteDoc(
+                      doc(db, "artifacts", appId, "public", "data", "branches", b.id)
+                    );
+                    if (branchId === b.id) setBranchId("");
+                  }}
+                >
+                  حذف
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  </div>
+)}
 
       {/* ============ MENU ============ */}
       {adminPage === "menu" && (
@@ -3412,7 +3548,7 @@ const getPayLabel = (pm) => {
 
         // 2) سجل الهدر بالتاريخ داخل wasteLogs
         const logRef = doc(
-          collection(db, "artifacts", appId, "public", "data", "wasteLogs")
+         colRef("wasteLogs")
         );
 
         tx.set(logRef, {
@@ -5263,7 +5399,7 @@ const cartTotalWithTax = cartSubtotal + cartTaxAmount;
     );
 
     await addDoc(
-      collection(db, "artifacts", appId, "public", "data", "orders"),
+      colRef("inventory"),
       {
         table,
         items,
