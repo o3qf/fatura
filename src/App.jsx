@@ -20,6 +20,9 @@ import {
 import { getAnalytics } from "firebase/analytics";
 import { initializeApp } from "firebase/app";
 import { runTransaction, increment } from "firebase/firestore";
+import { query, orderBy, limit } from "firebase/firestore";
+import { jsPDF } from "jspdf";
+import "./fonts/Cairo";
 
 
 
@@ -374,6 +377,694 @@ const Pill = ({ children, variant = "neutral" }) => {
   );
 };
 
+
+const getAccLabel = (accId, accSettings, lang) => {
+  if (!accId) return "-";
+
+  // 1) أسماء مخصصة محفوظة (لو موجودة)
+  const names = accSettings?.names || {};
+  const row = names?.[accId];
+  if (row) {
+    return (
+      row?.[lang] ||
+      row?.ar ||
+      row?.en ||
+      row?.tr ||
+      accId
+    );
+  }
+
+  // 2) أسماء افتراضية للحسابات الأساسية
+  const fallback = {
+    cash: "Cash / صندوق",
+    bank: "Bank / بنك",
+    ar: "Accounts Receivable / عملاء",
+    ap: "Accounts Payable / موردين",
+    sales: "Sales / مبيعات",
+    vat_output: "VAT Output / ضريبة",
+    expense: "Expense / مصروف",
+  };
+
+  return fallback[accId] || accId;
+};
+
+
+
+  // أسماء افتراضية لو ما انضافت في names
+//const fallback = {
+ // cash: { ar: "الصندوق", en: "Cash", tr: "Kasa" },
+ // bank: { ar: "البنك", en: "Bank", tr: "Banka" },
+  //sales: { ar: "المبيعات", en: "Sales", tr: "Satışlar" },
+ // vat_output: { ar: "ضريبة المخرجات", en: "VAT Output", tr: "KDV Çıkış" },
+//};
+
+//return fallback?.[accId]?.[lang] || fallback?.[accId]?.ar || accId;
+//};
+
+function ReceiptsPage({
+  customers,
+  receipts,
+  appId,
+  db,
+  CURRENCY,
+  postReceiptEntry,
+}) {
+  const [form, setForm] = React.useState({
+    customerId: "",
+    amount: "",
+    method: "cash",
+    note: "",
+    date: new Date().toISOString().slice(0, 10),
+  });
+
+  const customer = (customers || []).find((c) => c.id === form.customerId);
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-black">💵 سندات القبض</h2>
+      </div>
+
+      <div className="bg-white p-4 rounded-2xl border space-y-3">
+        <div className="font-black">سند قبض جديد</div>
+
+        <select
+          className="w-full border rounded-xl px-4 py-3 font-bold"
+          value={form.customerId}
+          onChange={(e) => setForm((p) => ({ ...p, customerId: e.target.value }))}
+        >
+          <option value="">— اختر عميل —</option>
+          {(customers || []).map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+
+        <div className="grid md:grid-cols-3 gap-3">
+          <input
+            className="border rounded-xl px-4 py-3 font-bold"
+            placeholder="المبلغ"
+            value={form.amount}
+            onChange={(e) => setForm((p) => ({ ...p, amount: e.target.value }))}
+            dir="ltr"
+          />
+
+          <select
+            className="border rounded-xl px-4 py-3 font-bold"
+            value={form.method}
+            onChange={(e) => setForm((p) => ({ ...p, method: e.target.value }))}
+            dir="ltr"
+          >
+            <option value="cash">cash</option>
+            <option value="bank">bank</option>
+          </select>
+
+          <input
+            type="date"
+            className="border rounded-xl px-4 py-3 font-bold"
+            value={form.date}
+            onChange={(e) => setForm((p) => ({ ...p, date: e.target.value }))}
+            dir="ltr"
+          />
+        </div>
+
+        <input
+          className="w-full border rounded-xl px-4 py-3 font-bold"
+          placeholder="ملاحظة (اختياري)"
+          value={form.note}
+          onChange={(e) => setForm((p) => ({ ...p, note: e.target.value }))}
+        />
+
+        <button
+          onClick={async () => {
+            const amount = Number(form.amount || 0);
+            if (!form.customerId) return alert("اختر عميل");
+            if (amount <= 0) return alert("اكتب مبلغ صحيح");
+
+            const customerName = customer?.name || "";
+
+            const ref = await addDoc(
+              collection(db, "artifacts", appId, "public", "data", "receipts"),
+              {
+                customerId: form.customerId,
+                customerName,
+                amount,
+                method: form.method,
+                note: form.note || "",
+                date: form.date,
+                createdAt: Date.now(),
+                accountingPosted: false,
+                accountingPostedAt: null,
+              }
+            );
+
+            // ترحيل محاسبي مرة واحدة
+            await postReceiptEntry({ id: ref.id, ...form, amount, customerName });
+
+            await updateDoc(
+              doc(db, "artifacts", appId, "public", "data", "receipts", ref.id),
+              {
+                accountingPosted: true,
+                accountingPostedAt: Date.now(),
+              }
+            );
+
+            setForm((p) => ({ ...p, amount: "", note: "" }));
+            alert("تم حفظ سند القبض وترحيله ✅");
+          }}
+          className="px-5 py-3 rounded-2xl bg-emerald-600 text-white font-black"
+        >
+          حفظ وترحيل
+        </button>
+      </div>
+
+      <div className="bg-white p-4 rounded-2xl border">
+        <div className="font-black mb-3">سندات القبض</div>
+
+        {receipts.length === 0 ? (
+          <div className="text-sm text-slate-500 font-bold">لا يوجد سندات.</div>
+        ) : (
+          <div className="overflow-auto">
+            <table className="w-full min-w-[900px]">
+              <thead>
+                <tr className="text-sm text-slate-500">
+                  <th className="text-right p-2">التاريخ</th>
+                  <th className="text-right p-2">العميل</th>
+                  <th className="text-right p-2">المبلغ</th>
+                  <th className="text-right p-2">الطريقة</th>
+                  <th className="text-right p-2">تم الترحيل</th>
+                </tr>
+              </thead>
+              <tbody>
+                {receipts.map((r) => (
+                  <tr key={r.id} className="border-t">
+                    <td className="p-2 font-bold">{r.date || "-"}</td>
+                    <td className="p-2 font-black">{r.customerName || "-"}</td>
+                    <td className="p-2 font-black">{Number(r.amount || 0).toFixed(2)} {CURRENCY}</td>
+                    <td className="p-2 font-bold" dir="ltr">{r.method || "-"}</td>
+                    <td className="p-2 font-bold">{r.accountingPosted ? "✅" : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+function CustomerLedger({
+  customers,
+  invoices,
+  selectedCustomerId,
+  setSelectedCustomerId,
+  CURRENCY,
+}) {
+  const customer = (customers || []).find((c) => c.id === selectedCustomerId) || null;
+
+  const custInvoices = (invoices || [])
+    .filter((inv) => inv.customerId === selectedCustomerId)
+    .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+
+
+    const custReceipts = (receipts || [])
+  .filter((r) => r.customerId === selectedCustomerId)
+  .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+
+const receiptsTotal = custReceipts.reduce((s, r) => s + Number(r.amount || 0), 0);
+
+
+  const paidTotal = custInvoices
+    .filter((x) => x.status === "paid")
+    .reduce((s, x) => s + Number(x.total || 0), 0);
+
+  const unpaidTotal = custInvoices
+    .filter((x) => x.status !== "paid" && x.status !== "void")
+    .reduce((s, x) => s + Number(x.total || 0), 0);
+
+  const balance = Math.max(0, unpaidTotal - receiptsTotal);
+ // مبدئيًا: الرصيد = غير المدفوع (لاحقًا نضيف دفعات جزئية)
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-black">📒 كشف حساب عميل</h2>
+      </div>
+
+      <div className="bg-white p-4 rounded-2xl border space-y-3">
+        <div className="font-black mb-1">اختر العميل</div>
+
+        <select
+          className="w-full border rounded-xl px-4 py-3 font-bold"
+          value={selectedCustomerId || ""}
+          onChange={(e) => setSelectedCustomerId(e.target.value)}
+        >
+          <option value="">— اختر عميل —</option>
+          {(customers || []).map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+
+        {customer ? (
+          <div className="grid md:grid-cols-3 gap-3 pt-2">
+            <div className="p-3 rounded-2xl bg-slate-50 border">
+              <div className="text-sm text-slate-500 font-bold">مدفوع</div>
+              <div className="text-2xl font-black mt-1">
+                {paidTotal.toFixed(2)} {CURRENCY}
+              </div>
+            </div>
+
+            <div className="p-3 rounded-2xl bg-slate-50 border">
+              <div className="text-sm text-slate-500 font-bold">غير مدفوع</div>
+              <div className="text-2xl font-black mt-1">
+                {unpaidTotal.toFixed(2)} {CURRENCY}
+              </div>
+            </div>
+
+            <div className="p-3 rounded-2xl bg-slate-50 border">
+              <div className="text-sm text-slate-500 font-bold">الرصيد</div>
+              <div className="text-2xl font-black mt-1">
+                {balance.toFixed(2)} {CURRENCY}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="text-sm text-slate-500 font-bold">اختر عميل لعرض كشف الحساب.</div>
+        )}
+      </div>
+
+      {customer && (
+        <div className="bg-white p-4 rounded-2xl border">
+          <div className="font-black mb-3">حركات العميل (الفواتير)</div>
+
+          {custInvoices.length === 0 ? (
+            <div className="text-sm text-slate-500 font-bold">لا توجد فواتير لهذا العميل.</div>
+          ) : (
+            <div className="overflow-auto">
+              <table className="w-full min-w-[900px]">
+                <thead>
+                  <tr className="text-sm text-slate-500">
+                    <th className="text-right p-2">التاريخ</th>
+                    <th className="text-right p-2">الفاتورة</th>
+                    <th className="text-right p-2">الحالة</th>
+                    <th className="text-right p-2">الإجمالي</th>
+                    <th className="text-right p-2">مدين</th>
+                    <th className="text-right p-2">دائن</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {custInvoices.map((inv) => {
+                    const total = Number(inv.total || 0);
+                    const isPaid = inv.status === "paid";
+                    const dateStr = inv.createdAt
+                      ? new Date(inv.createdAt).toISOString().slice(0, 10)
+                      : "-";
+
+                    // ledger style: invoice creates debit (customer owes)
+                    const debit = total;
+                    const credit = isPaid ? total : 0;
+
+                    return (
+                      <tr key={inv.id} className="border-t">
+                        <td className="p-2 font-bold">{dateStr}</td>
+                        <td className="p-2 font-black" dir="ltr">
+                          {inv.invoiceNumber}
+                        </td>
+                        <td className="p-2 font-bold">{inv.status}</td>
+                        <td className="p-2 font-black">
+                          {total.toFixed(2)} {CURRENCY}
+                        </td>
+                        <td className="p-2 font-black">{debit.toFixed(2)}</td>
+                        <td className="p-2 font-black">{credit.toFixed(2)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+
+function ReportsPanel({ journalEntries, CURRENCY, accSettings, accounts, lang }) {
+
+
+const ACC = accSettings?.accounts || { vatOutput: ACC.vatOutput };
+
+
+  const today = new Date();
+  const todayStr = today.toISOString().slice(0, 10);
+  const monthStr = todayStr.slice(0, 7);
+
+
+
+  const [plFrom, setPlFrom] = React.useState(() => {
+  const d = new Date();
+  const first = new Date(d.getFullYear(), d.getMonth(), 1);
+  return first.toISOString().slice(0, 10);
+});
+const [plTo, setPlTo] = React.useState(() => new Date().toISOString().slice(0, 10));
+
+const inRange = (dStr) => {
+  if (!dStr) return false;
+  return dStr >= plFrom && dStr <= plTo;
+};
+
+const accTypeById = (accId) => {
+  const a = (accounts || []).find((x) => x.key === accId);
+  return a?.type || null; // revenue / expense / ...
+};
+
+
+  const safe = Array.isArray(journalEntries) ? journalEntries : [];
+
+  const salesEntries = safe.filter((j) => j?.refType === "order");
+
+
+
+  // ===== P&L (Profit & Loss) =====
+let revenueTotal = 0;
+let expenseTotal = 0;
+
+const plByAccount = {}; // accId -> amount
+
+for (const j of safe) {
+  if (!inRange(j?.date || "")) continue;
+
+  const lines = Array.isArray(j.lines) ? j.lines : [];
+  for (const l of lines) {
+    const accId = String(l?.accountId || "");
+    if (!accId) continue;
+
+    const t = accTypeById(accId);
+    if (t !== "revenue" && t !== "expense") continue;
+
+    const debit = Number(l?.debit || 0);
+    const credit = Number(l?.credit || 0);
+
+    // revenue الطبيعي: credit - debit
+    // expense الطبيعي: debit - credit
+    const amt = t === "revenue" ? (credit - debit) : (debit - credit);
+
+    plByAccount[accId] = (plByAccount[accId] || 0) + amt;
+
+    if (t === "revenue") revenueTotal += amt;
+    if (t === "expense") expenseTotal += amt;
+  }
+}
+
+
+
+const profit = revenueTotal - expenseTotal;
+
+
+// ===== Export P&L CSV =====
+const exportPLCSV = () => {
+  const rows = [
+    ["from", plFrom],
+    ["to", plTo],
+    [],
+    ["accountId", "accountName", "amount"],
+    ...plRows.map((r) => [
+      r.accountId,
+      getAccLabel(r.accountId, accounts, lang),
+      Number(r.amount || 0).toFixed(2),
+    ]),
+    [],
+    ["total_revenue", Number(revenueTotal || 0).toFixed(2)],
+    ["total_expense", Number(expenseTotal || 0).toFixed(2)],
+    ["profit", Number(profit || 0).toFixed(2)],
+  ];
+
+  const csv = rows
+    .map((r) => r.map((x) => `"${String(x ?? "").replace(/"/g, '""')}"`).join(","))
+    .join("\n");
+
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `PL_${plFrom}_to_${plTo}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+};
+
+// ===== Export P&L PDF =====
+const printPL = () => {
+  const html = `
+    <html dir="rtl">
+    <head>
+      <meta charset="utf-8" />
+      <title>P&L</title>
+      <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        h1 { margin-bottom: 12px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: right; }
+        th { background: #f5f5f5; }
+      </style>
+    </head>
+    <body>
+      <h1>تقرير الأرباح والخسائر</h1>
+      <div>الفترة: ${plFrom} — ${plTo}</div>
+      <div>إجمالي الإيرادات: ${revenueTotal.toFixed(2)} ${CURRENCY}</div>
+      <div>إجمالي المصروفات: ${expenseTotal.toFixed(2)} ${CURRENCY}</div>
+      <div><b>صافي الربح: ${profit.toFixed(2)} ${CURRENCY}</b></div>
+
+      <table>
+        <thead>
+          <tr><th>الحساب</th><th>المبلغ</th></tr>
+        </thead>
+        <tbody>
+          ${plRows
+            .map(
+              (r) =>
+                `<tr>
+                  <td>${getAccLabel(r.accountId, accounts, lang)} (${r.accountId})</td>
+                  <td>${Number(r.amount || 0).toFixed(2)} ${CURRENCY}</td>
+                </tr>`
+            )
+            .join("")}
+        </tbody>
+      </table>
+    </body>
+    </html>
+  `;
+
+  const w = window.open("", "_blank");
+  w.document.write(html);
+  w.document.close();
+  w.print();
+};
+
+
+const plRows = Object.entries(plByAccount)
+  .map(([accountId, amount]) => ({ accountId, amount }))
+  .sort((a, b) => b.amount - a.amount);
+
+
+
+  const sumTotal = (arr) =>
+    arr.reduce((s, j) => s + Number(j?.totalDebit || 0), 0);
+
+  const todaySales = sumTotal(
+    salesEntries.filter((j) => (j?.date || "") === todayStr)
+  );
+  const monthSales = sumTotal(
+    salesEntries.filter((j) => (j?.date || "").startsWith(monthStr))
+  );
+
+  const vatToday = salesEntries
+    .filter((j) => (j?.date || "") === todayStr)
+    .reduce((s, j) => {
+      const l = (j.lines || []).find((x) => x.accountId === ACC.vatOutput);
+      return s + Number(l?.credit || 0);
+    }, 0);
+
+  const vatMonth = salesEntries
+    .filter((j) => (j?.date || "").startsWith(monthStr))
+    .reduce((s, j) => {
+      const l = (j.lines || []).find((x) => x.accountId === ACC.vatOutput);
+      return s + Number(l?.credit || 0);
+    }, 0);
+
+  const tb = {};
+  safe.forEach((j) =>
+    (j.lines || []).forEach((l) => {
+      tb[l.accountId] ??= { d: 0, c: 0 };
+      tb[l.accountId].d += Number(l.debit || 0);
+      tb[l.accountId].c += Number(l.credit || 0);
+    })
+  );
+
+  const money = (n) => `${Number(n || 0).toFixed(2)} ${CURRENCY}`;
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-xl font-black">📊 التقارير</h2>
+
+      <div className="grid md:grid-cols-2 gap-4">
+        <div className="bg-white p-4 rounded-2xl border">
+          <div className="font-bold text-slate-500">مبيعات اليوم</div>
+          <div className="text-2xl font-black">{money(todaySales)}</div>
+        </div>
+        <div className="bg-white p-4 rounded-2xl border">
+          <div className="font-bold text-slate-500">مبيعات الشهر</div>
+          <div className="text-2xl font-black">{money(monthSales)}</div>
+        </div>
+      </div>
+
+      <div className="bg-white p-4 rounded-2xl border">
+        <div className="font-black mb-2">ملخص الضريبة</div>
+        <div className="flex gap-6">
+          <div>اليوم: {money(vatToday)}</div>
+          <div>الشهر: {money(vatMonth)}</div>
+        </div>
+      </div>
+
+
+<div className="bg-white p-4 rounded-2xl border">
+  <div className="flex items-center justify-between gap-3 mb-3">
+   <div className="flex items-center justify-between gap-3 mb-3">
+  <div className="font-black">تقرير الأرباح والخسائر (P&L)</div>
+
+  <div className="flex items-center gap-2">
+    <button
+      onClick={exportPLCSV}
+      className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-black"
+    >
+      تصدير CSV
+    </button>
+
+    <button
+      onClick={printPL}
+      className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
+    >
+      تصدير PDF
+    </button>
+  </div>
+</div>
+
+
+    <div className="flex items-center gap-2">
+      <input
+        type="date"
+        value={plFrom}
+        onChange={(e) => setPlFrom(e.target.value)}
+        className="border rounded-xl px-3 py-2 font-bold"
+        dir="ltr"
+      />
+      <span className="text-slate-400 font-black">—</span>
+      <input
+        type="date"
+        value={plTo}
+        onChange={(e) => setPlTo(e.target.value)}
+        className="border rounded-xl px-3 py-2 font-bold"
+        dir="ltr"
+      />
+    </div>
+  </div>
+
+  <div className="grid md:grid-cols-3 gap-3 mb-4">
+    <div className="p-3 rounded-2xl bg-slate-50 border">
+      <div className="text-sm text-slate-500 font-bold">إجمالي الإيرادات</div>
+      <div className="text-2xl font-black mt-1">{money(revenueTotal)}</div>
+    </div>
+    <div className="p-3 rounded-2xl bg-slate-50 border">
+      <div className="text-sm text-slate-500 font-bold">إجمالي المصروفات</div>
+      <div className="text-2xl font-black mt-1">{money(expenseTotal)}</div>
+    </div>
+    <div className="p-3 rounded-2xl bg-slate-50 border">
+      <div className="text-sm text-slate-500 font-bold">صافي الربح</div>
+      <div className="text-2xl font-black mt-1">{money(profit)}</div>
+    </div>
+  </div>
+
+  {plRows.length === 0 ? (
+    <div className="text-sm text-slate-500 font-bold">
+      لا توجد حسابات إيرادات/مصروفات ضمن الفترة. تأكد أن نوع الحساب في شجرة الحسابات = revenue أو expense.
+    </div>
+  ) : (
+    <div className="overflow-auto">
+      <table className="w-full min-w-[800px]">
+        <thead>
+          <tr className="text-sm text-slate-500">
+            <th className="text-right p-2">الحساب</th>
+            <th className="text-right p-2">المبلغ</th>
+          </tr>
+        </thead>
+        <tbody>
+          {plRows.map((r) => (
+            <tr key={r.accountId} className="border-t">
+              <td className="p-2 font-black">
+                {getAccLabel(r.accountId, accounts, lang)}
+                <div className="text-xs text-slate-500 font-bold" dir="ltr">
+                  {r.accountId}
+                </div>
+              </td>
+              <td className="p-2 font-black">{money(r.amount)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )}
+</div>
+
+
+      <div className="bg-white p-4 rounded-2xl border">
+        <div className="font-black mb-2">ميزان المراجعة</div>
+        <table className="w-full" dir="ltr">
+
+          <thead>
+  <tr>
+    <th className="text-left">الحساب</th>
+    <th className="text-right">مدين</th>
+    <th className="text-right">دائن</th>
+  </tr>
+</thead>
+
+          <tbody>
+            {Object.entries(tb).map(([k, v]) => (
+              <tr key={k}>
+               <td className="p-2 font-black">
+  <div className="flex flex-col">
+    <span className="font-black">
+      {getAccLabel(k, accounts, lang)
+}
+    </span>
+    <span className="text-xs text-slate-500 font-bold" dir="ltr">
+      {k}
+    </span>
+  </div>
+</td>
+
+
+                <td>{money(v.d)}</td>
+                <td>{money(v.c)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+
 const normalizeDigits = (s = "") =>
   String(s)
     // Arabic-Indic ٠١٢٣٤٥٦٧٨٩
@@ -389,45 +1080,6 @@ export default function App() {
      - الإدارة + Portal: "/admin"
      ========================= */
   
-// ===== Branches (NEW) =====
-const [branchId, setBranchId] = useState("");
-const [branchPick, setBranchPick] = useState("");
-
-
-
-
-
-
-// ===== Branches UI State =====
-const [branches, setBranches] = useState([]);
-const [newBranchName, setNewBranchName] = useState("");
-const [showBranchPicker, setShowBranchPicker] = useState(false);
-
-
-
-// ===== Branch Helpers =====
-const branchRoot = useMemo(() => {
-  return branchId
-    ? ["artifacts", appId, "public", "data", "branches", branchId]
-    : null;
-}, [branchId, appId]);
-
-
-const colRef = (name) => {
-  if (!branchRoot) {
-    return collection(db, "artifacts", appId, "public", "data", name);
-  }
-  return collection(db, ...branchRoot, name);
-};
-
-const docRef = (name, id) => {
-  if (!branchRoot) {
-    return doc(db, "artifacts", appId, "public", "data", name, id);
-  }
-  return doc(db, ...branchRoot, name, id);
-};
-
-
 
   // portal لا يظهر للعميل (العميل يدخل مباشرة الاختيار)
   const path = typeof window !== "undefined" ? window.location.pathname : "/";
@@ -447,7 +1099,10 @@ const [isOwner, setIsOwner] = useState(false);
 
 
 // Admin navigation (NEW)
-const [adminPage, setAdminPage] = useState("menu"); // "menu" | "orders" | "inventory"
+const [adminPage, setAdminPage] = useState("menu"); 
+// "menu" | "orders" | "inventory" | "finance" | "accounting"
+
+
 const [ordersTab, setOrdersTab] = useState("active"); // "active" | "old"
 
 
@@ -492,6 +1147,328 @@ const [newOwnerPass, setNewOwnerPass] = useState("");
 const [newOwnerUser, setNewOwnerUser] = useState("");
 
 const [taxPercent, setTaxPercent] = useState(0); // ✅ ضريبة عامة %
+
+
+// =========================
+// Accounting Engine (Golden-like)
+// =========================
+const DEFAULT_ACCOUNTS = {
+  cash: "cash",
+  bank: "bank",
+  sales: "sales",
+  vatOutput: "vat_output",
+};
+
+async function createJournalEntry({ date, memo, lines, refType, refId }) {
+  const cleanLines = (lines || []).map((l) => ({
+    accountId: String(l.accountId),
+    debit: Number(l.debit || 0),
+    credit: Number(l.credit || 0),
+  }));
+
+  const totalDebit = cleanLines.reduce((s, l) => s + l.debit, 0);
+  const totalCredit = cleanLines.reduce((s, l) => s + l.credit, 0);
+
+  if (Math.abs(totalDebit - totalCredit) > 0.0001) {
+    throw new Error("Journal not balanced");
+  }
+
+  const payload = {
+    date: date || new Date().toISOString().slice(0, 10),
+    memo: memo || "",
+    refType: refType || null,
+    refId: refId || null,
+    lines: cleanLines,
+    totalDebit,
+    totalCredit,
+    createdAt: Date.now(),
+  };
+
+  await addDoc(
+    collection(db, "artifacts", appId, "public", "data", "journalEntries"),
+    payload
+  );
+}
+
+async function postSalesEntryForInvoice(invoice) {
+  const total = Number(invoice.total || 0);
+  const tax = Number(invoice.taxAmount || 0);
+  const netSales = Math.max(0, total - tax);
+
+  const ACC = accSettings?.accounts || {
+    cash: "cash",
+    bank: "bank",
+    sales: "sales",
+    vatOutput: "vat_output",
+  };
+
+  const debitAccount = ACC.cash; // لاحقًا نخليها حسب طريقة الدفع
+
+  const lines = [
+    { accountId: debitAccount, debit: total, credit: 0 },
+    { accountId: ACC.sales, debit: 0, credit: netSales },
+  ];
+
+  if (tax > 0) {
+    lines.push({ accountId: ACC.vatOutput, debit: 0, credit: tax });
+  }
+
+  await createJournalEntry({
+    date: new Date().toISOString().slice(0, 10),
+    memo: "فاتورة مبيعات",
+    refText: invoice.invoiceNumber,
+    lines,
+    refType: "invoice",
+    refId: invoice.id,
+  });
+}
+
+
+
+async function exportJournalPDF() {
+  try {
+
+    
+    const docPdf = new jsPDF({ unit: "pt", format: "a4" });
+docPdf.setFont("Cairo");
+docPdf.setR2L(true);
+
+
+docPdf.text("قيود اليومية", 550, 50, { align: "right" });
+
+
+docPdf.text(accName, 550, y, { align: "right" });
+
+    // عنوان
+    docPdf.setFontSize(16);
+    docPdf.text("Journal Entries - قيود اليومية", 40, 50);
+
+    // تاريخ الطباعة
+    docPdf.setFontSize(10);
+    docPdf.text(`Generated: ${new Date().toISOString().slice(0, 10)}`, 40, 70);
+
+    let y = 100;
+
+    // كل قيد
+    (journalEntries || []).slice(0, 40).forEach((j, idx) => {
+      if (y > 760) {
+        docPdf.addPage();
+        y = 50;
+      }
+
+      docPdf.setFontSize(11);
+      docPdf.text(
+        `${idx + 1}) ${j.date || "-"} | ${j.memo || ""} | ${j.refText || ""}`,
+        40,
+        y
+      );
+
+      y += 16;
+
+      // البنود
+      (j.lines || []).forEach((l) => {
+        if (y > 760) {
+          docPdf.addPage();
+          y = 50;
+        }
+
+        const accName = getAccLabel(l.accountId, accSettings, lang);
+
+docPdf.text(accName, 550, y, { align: "right" });
+docPdf.text(`Dr: ${debit}`, 320, y);
+docPdf.text(`Cr: ${credit}`, 430, y);
+
+        const debit = Number(l.debit || 0).toFixed(2);
+        const credit = Number(l.credit || 0).toFixed(2);
+
+        docPdf.setFontSize(10);
+        docPdf.text(`- ${accName}`, 60, y);
+        docPdf.text(`Dr: ${debit}`, 320, y);
+        docPdf.text(`Cr: ${credit}`, 430, y);
+
+        y += 14;
+      });
+
+      y += 10;
+    });
+
+    docPdf.save("journal.pdf");
+  } catch (err) {
+    console.error(err);
+    alert("PDF Error: " + (err?.message || String(err)));
+  }
+}
+
+
+
+async function postBillEntry(bill) {
+  const total = Number(bill.total || 0);
+  if (total <= 0) return;
+
+  const ACC = accSettings?.accounts || {
+    ap: "ap",
+    cash: "cash",
+    bank: "bank",
+  };
+
+  // حساب المصروف/المخزون اللي تحطه في الفاتورة
+  const expenseAcc = bill.expenseAccountId || "expense";
+
+  const lines = [
+    { accountId: expenseAcc, debit: total, credit: 0 },
+    { accountId: ACC.ap || "ap", debit: 0, credit: total },
+  ];
+
+  await createJournalEntry({
+    date: bill.date || new Date().toISOString().slice(0, 10),
+    memo: "فاتورة مشتريات",
+    refText: bill.billNumber || `BILL-${String(bill.id || "").slice(0, 6)}`,
+    lines,
+    refType: "bill",
+    refId: bill.id,
+  });
+}
+
+
+
+
+async function postVendorPaymentEntry(p) {
+  const amount = Number(p.amount || 0);
+  if (amount <= 0) return;
+
+  const ACC = accSettings?.accounts || {
+    ap: "ap",
+    cash: "cash",
+    bank: "bank",
+  };
+
+  const creditAcc = p.method === "bank" ? ACC.bank : ACC.cash;
+
+  const lines = [
+    { accountId: ACC.ap || "ap", debit: amount, credit: 0 },
+    { accountId: creditAcc, debit: 0, credit: amount },
+  ];
+
+  await createJournalEntry({
+    date: p.date || new Date().toISOString().slice(0, 10),
+    memo: "سند صرف مورد",
+    refText: `VP-${String(p.id || "").slice(0, 6)}`,
+    lines,
+    refType: "vendor_payment",
+    refId: p.id,
+  });
+}
+
+
+
+const getAccountBalances = (journal) => {
+  const bal = {};
+  (journal || []).forEach((j) => {
+    (j.lines || []).forEach((l) => {
+      if (!bal[l.accountId]) bal[l.accountId] = 0;
+      bal[l.accountId] += Number(l.debit || 0) - Number(l.credit || 0);
+    });
+  });
+  return bal;
+};
+
+
+const getCashFlow = (journal, acc) => {
+  let inflow = 0;
+  let outflow = 0;
+
+  (journal || []).forEach((j) => {
+    (j.lines || []).forEach((l) => {
+      if (l.accountId === acc.cash || l.accountId === acc.bank) {
+        const d = Number(l.debit || 0);
+        const c = Number(l.credit || 0);
+        inflow += d;
+        outflow += c;
+      }
+    });
+  });
+
+  return {
+    inflow,
+    outflow,
+    net: inflow - outflow,
+  };
+};
+
+
+
+async function postSalesEntryForInvoice(invoice) {
+  const total = Number(invoice.total || 0);
+  const tax = Number(invoice.taxAmount || 0);
+  const netSales = Math.max(0, total - tax);
+
+  const ACC = accSettings?.accounts || {
+    cash: "cash",
+    bank: "bank",
+    sales: "sales",
+    vatOutput: "vat_output",
+  };
+
+
+  async function postReceiptEntry(receipt) {
+  const amount = Number(receipt.amount || 0);
+  if (amount <= 0) return;
+
+  const ACC = accSettings?.accounts || {
+    cash: "cash",
+    bank: "bank",
+    ar: "ar",
+    ap: "ap",
+
+  };
+
+
+
+  
+
+
+  const method = receipt.method || "cash";
+  const debitAccount = method === "bank" ? ACC.bank : ACC.cash;
+
+  // قبض: Dr Cash/Bank, Cr AR
+  const lines = [
+    { accountId: debitAccount, debit: amount, credit: 0 },
+    { accountId: ACC.ar || "ar", debit: 0, credit: amount },
+  ];
+
+  await createJournalEntry({
+    date: receipt.date || new Date().toISOString().slice(0, 10),
+    memo: "سند قبض عميل",
+    refText: `RCPT-${String(receipt.id || "").slice(0, 6)}`,
+    lines,
+    refType: "receipt",
+    refId: receipt.id,
+  });
+}
+
+
+  // افتراض: الدفع نقدي (نطوّرها لاحقًا)
+  const debitAccount = ACC.cash;
+
+  const lines = [
+    { accountId: debitAccount, debit: total, credit: 0 },
+    { accountId: ACC.sales, debit: 0, credit: netSales },
+  ];
+
+  if (tax > 0) {
+    lines.push({ accountId: ACC.vatOutput, debit: 0, credit: tax });
+  }
+
+  await createJournalEntry({
+    date: new Date().toISOString().slice(0, 10),
+    memo: "فاتورة مبيعات",
+    refText: invoice.invoiceNumber,
+    lines,
+    refType: "invoice",
+    refId: invoice.id,
+  });
+}
+
 
 // =========================
 // Firestore Paths (لازم تكون فوق قبل أي استخدام)
@@ -562,16 +1539,6 @@ const applyOldOrdersFilter = () => {
 
 
 
-
-// ✅ العميل يحدد الفرع من الرابط: ?branch=BRANCH_ID
-useEffect(() => {
-  if (typeof window === "undefined") return;
-  const params = new URLSearchParams(window.location.search);
-  const b = params.get("branch");
-  if (b) setBranchId(b);
-}, []);
-
-
 // 5B: restore admin session
 useEffect(() => {
   if (typeof window === "undefined") return;
@@ -605,8 +1572,6 @@ useEffect(() => {
 
   const [user, setUser] = useState(null);
 
-
-  
   // Customer language
   const [lang, setLang] = useState("ar");
   // Admin language
@@ -621,8 +1586,6 @@ useEffect(() => {
   // ===== فلتر الطلبات القديمة =====
 const [oldFrom, setOldFrom] = useState(""); // تاريخ البداية
 const [oldTo, setOldTo] = useState("");     // تاريخ النهاية
-
-
 
 
 // ===== تحويل تاريخ الطلب إلى Date (مهم لفلترة الطلبات القديمة) =====
@@ -664,44 +1627,57 @@ const [oldFilterError, setOldFilterError] = useState("");
 
 
 const [orders, setOrders] = useState([]);
-// ===== تقسيم المخزون =====
+
+const [invoices, setInvoices] = useState([]);
+const [receipts, setReceipts] = useState([]);
+const [vendorPayments, setVendorPayments] = useState([]);
+
+const [bills, setBills] = useState([]);
+
+
+
+const [customers, setCustomers] = useState([]);
+
+const [vendors, setVendors] = useState([]);
+const [editingVendor, setEditingVendor] = useState(null);
+
+
+const [selectedCustomerId, setSelectedCustomerId] = useState("");
+
+const [editingCustomer, setEditingCustomer] = useState(null);
+
+
+const [editingInvoice, setEditingInvoice] = useState(null); // modal/form
+
+
+const [accSettings, setAccSettings] = useState({
+  accounts: {
+    cash: "cash",
+    bank: "bank",
+    sales: "sales",
+    vatOutput: "vat_output",
+    ar: "ar",
+    ap: "ap",
+
+  },
+});
+
+const [accounts, setAccounts] = useState([]);
+
+
+
+const [journalEntries, setJournalEntries] = useState([]);
+const [openJournalId, setOpenJournalId] = useState(null);
+
 
 
 console.log("APP ID =", appId, "MENU =", menuItems.length);
 
-// ✅ Inventory 
+// ✅ Inventory
 const [inventory, setInventory] = useState([]);
 
-// ===== هدر (Waste Logs) =====
-const [wasteLogs, setWasteLogs] = useState([]);
-
-useEffect(() => {
-  const ref = collection(db, "artifacts", appId, "public", "data", "wasteLogs");
-  return onSnapshot(ref, (snap) => {
-    const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() })); // ✅ هنا الإصلاح
-    setWasteLogs(arr);
-  });
-}, [appId]);
-
-
-
-
-
-
-const activeInventory = useMemo(
-  () => (inventory || []).filter((x) => !x.isWaste),
-  [inventory]
-);
-
-const wasteInventory = useMemo(
-  () => (inventory || []).filter((x) => !!x.isWaste),
-  [inventory]
-);
-
-
 const computedOutOfStock = useMemo(() => {
- const invMap = new Map(activeInventory.map((x) => [x.id, x])); // ✅ فقط المخزون
-
+  const invMap = new Map(inventory.map((x) => [x.id, x]));
 
   const orderDateToJS = (createdAt) => {
   if (!createdAt) return null;
@@ -833,7 +1809,6 @@ const [vipEdit, setVipEdit] = useState(null); // وضع التعديل
 // داخل create order
 const [vipPickerOpen, setVipPickerOpen] = useState(false);
 const [selectedVip, setSelectedVip] = useState(null);
-
 
 
 
@@ -1143,9 +2118,8 @@ const adminTotal = useMemo(() => {
       }
     );
 
-
     const unsubOrders = onSnapshot(
-      colRef("orders"),
+      collection(db, "artifacts", appId, "public", "data", "orders"),
       (snap) => {
         const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
         // newest first
@@ -1154,31 +2128,121 @@ const adminTotal = useMemo(() => {
       }
     );
 
+
+    const unsubInvoices = onSnapshot(
+  query(
+    collection(db, "artifacts", appId, "public", "data", "invoices"),
+    orderBy("createdAt", "desc")
+  ),
+  (snap) => {
+    setInvoices(snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) })));
+  }
+);
+
+
+const unsubCustomers = onSnapshot(
+  query(
+    collection(db, "artifacts", appId, "public", "data", "customers"),
+    orderBy("createdAt", "desc")
+  ),
+  (snap) => {
+    setCustomers(snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) })));
+  }
+);
+
+
+const unsubReceipts = onSnapshot(
+  query(
+    collection(db, "artifacts", appId, "public", "data", "receipts"),
+    orderBy("createdAt", "desc")
+  ),
+  (snap) => {
+    setReceipts(snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) })));
+  }
+);
+
+
      const unsubInv = onSnapshot(
     collection(db, "artifacts", appId, "public", "data", "inventory"),
     (snap) => {
-      setInventory(snap.docs.map((d) => ({ id: d.id, ...d.data(),
-    isWaste: !!d.data().isWaste, })));
+      setInventory(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     }
   );
+
+
+
+  const unsubVendors = onSnapshot(
+  query(
+    collection(db, "artifacts", appId, "public", "data", "vendors"),
+    orderBy("createdAt", "desc")
+  ),
+  (snap) => {
+    setVendors(snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) })));
+  }
+);
+
+
+const unsubBills = onSnapshot(
+  query(
+    collection(db, "artifacts", appId, "public", "data", "bills"),
+    orderBy("createdAt", "desc")
+  ),
+  (snap) => {
+    setBills(snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) })));
+  }
+);
+
+
+
+const unsubVendorPayments = onSnapshot(
+  query(
+    collection(db, "artifacts", appId, "public", "data", "vendor_payments"),
+    orderBy("createdAt", "desc")
+  ),
+  (snap) => {
+    setVendorPayments(snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) })));
+  }
+);
+
+
     return () => {
       unsubMenu();
       unsubOrders();
        unsubInv();
+       unsubJournal();
+       unsubAccounts();
+       unsubInvoices();
+       unsubCustomers();
+       unsubReceipts();
+       unsubVendors();
+       unsubBills();
+       unsubVendorPayments();
     };
   }, [user]);
 
 
+  const unsubJournal = onSnapshot(
+  query(
+    collection(db, "artifacts", appId, "public", "data", "journalEntries"),
+    orderBy("createdAt", "desc"),
+    limit(50)
+  ),
+  (snap) => {
+    setJournalEntries(snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) })));
+  }
+);
 
-// ✅ جلب الفروع (دائمًا من المسار الرئيسي - ليس داخل فرع)
-useEffect(() => {
-  const ref = collection(db, "artifacts", appId, "public", "data", "branches");
-  return onSnapshot(ref, (snap) => {
-    const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    arr.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
-    setBranches(arr);
-  });
-}, [appId]);
+
+
+const unsubAccounts = onSnapshot(
+  query(
+    collection(db, "artifacts", appId, "public", "data", "accounts"),
+    orderBy("code", "asc")
+  ),
+  (snap) => {
+    setAccounts(snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) })));
+  }
+);
 
 
 
@@ -1423,6 +2487,17 @@ useEffect(() => {
     [orders]
   );
 
+
+  const cashFlow = useMemo(
+  () =>
+    getCashFlow(journalEntries, {
+      cash: accSettings?.accounts?.cash || "cash",
+      bank: accSettings?.accounts?.bank || "bank",
+    }),
+  [journalEntries, accSettings]
+);
+
+
   const oldOrders = useMemo(() => {
   let list = orders.filter(o => o.status !== "new");
 
@@ -1496,23 +2571,6 @@ useEffect(() => {
   };
 }, [orders, menuItems, financeMode, finDate, finFrom, finTo]);
 
-
-// ===== فلترة الهدر حسب فترة finance =====
-const filteredWasteLogs = useMemo(() => {
-  return (wasteLogs || []).filter((w) =>
-    inFinanceRange({ timestamp: w.timestamp })
-  );
-}, [wasteLogs, financeMode, finDate, finFrom, finTo]);
-
-const wasteTotal = useMemo(() => {
-  return filteredWasteLogs.reduce(
-    (s, w) => s + Number(w.totalCost || 0),
-    0
-  );
-}, [filteredWasteLogs]);
-
-
-
 const financeWithInventory = useMemo(() => {
   // ✅ فلترة الطلبات حسب التاريخ + (اختياري) حسب الحالة
   const filteredOrders = (orders || []).filter((o) => {
@@ -1525,8 +2583,6 @@ const financeWithInventory = useMemo(() => {
     return true;
   });
 
- 
-
   // مباع لكل منتج
   const soldMap = new Map(); // menuId -> qty
   filteredOrders.forEach((o) => {
@@ -1537,10 +2593,8 @@ const financeWithInventory = useMemo(() => {
   });
 
   // خرائط للمخزون
-  const invMap = new Map(activeInventory.map((x) => [x.id, x])); // invId -> invObj
+  const invMap = new Map(inventory.map((x) => [x.id, x])); // invId -> invObj
 
-
-  
   // ✅ إجمالي الاستهلاك لكل عنصر مخزون عبر كل المنتجات
   const invUsageTotalMap = new Map(); // invId -> usedQty
 
@@ -1559,7 +2613,6 @@ const financeWithInventory = useMemo(() => {
         const needForOne = Number(ing.amountPerOne || 0);
         if (!invId || needForOne <= 0 || soldQty <= 0) return null;
 
-        
         const inv = invMap.get(invId);
         if (!inv || inv.unit === "none") return null;
 
@@ -1607,16 +2660,41 @@ const financeWithInventory = useMemo(() => {
     invRows,
     totalNet: rows.reduce((s, r) => s + Number(r.netTotal || 0), 0),
   };
-}, [orders, activeInventory, menuItems, financeMode, finDate, finFrom, finTo]);
+}, [orders, menuItems, inventory, financeMode, finDate, finFrom, finTo]);
+
+
+const balances = useMemo(
+  () => getAccountBalances(journalEntries),
+  [journalEntries]
+);
+
+const assets = [
+  { id: accSettings?.accounts?.cash || "cash", name: "Cash / صندوق" },
+  { id: accSettings?.accounts?.bank || "bank", name: "Bank / بنك" },
+  { id: accSettings?.accounts?.ar || "ar", name: "Accounts Receivable / عملاء" },
+];
+
+const liabilities = [
+  { id: accSettings?.accounts?.ap || "ap", name: "Accounts Payable / موردين" },
+  { id: accSettings?.accounts?.vatOutput || "vat_output", name: "VAT Output / ضريبة" },
+];
+
+const totalAssets = assets.reduce(
+  (s, a) => s + Math.max(0, balances[a.id] || 0),
+  0
+);
+
+const totalLiabilities = liabilities.reduce(
+  (s, l) => s + Math.max(0, -(balances[l.id] || 0)),
+  0
+);
+
+const equity = totalAssets - totalLiabilities;
 
 
 
   const inventoryAlerts = useMemo(() => {
-const invMap = new Map((inventory || []).map((x) => [x.id, x])); // ✅ يشمل الهدر كمان
-
-
-
-  
+  const invMap = new Map(inventory.map((x) => [x.id, x]));
   const usedInv = new Map(); // invId -> أقل كمية لصنع منتج واحد
 
   // نجمع أقل amountPerOne لكل عنصر مخزون (يعني: أقل كمية يحتاجها منتج واحد)
@@ -1709,6 +2787,110 @@ const invMap = new Map((inventory || []).map((x) => [x.id, x])); // ✅ يشمل
   /* =========================
      Admin actions
      ========================= */
+
+     const nextInvoiceNumber = async () => {
+  const counterRef = doc(db, "artifacts", appId, "public", "data", "counters", "invoices");
+  const year = new Date().getFullYear();
+
+  const result = await runTransaction(db, async (tx) => {
+    const snap = await tx.get(counterRef);
+    const data = snap.exists() ? snap.data() : {};
+    const currYear = data.year || year;
+    let seq = Number(data.seq || 0);
+
+    // لو سنة جديدة نرجّع العدّاد
+    if (currYear !== year) seq = 0;
+
+    seq += 1;
+
+    tx.set(counterRef, { year, seq }, { merge: true });
+
+    const num = `INV-${year}-${String(seq).padStart(4, "0")}`;
+    return num;
+  });
+
+  return result;
+};
+
+
+
+const nextBillNumber = async () => {
+  const counterRef = doc(db, "artifacts", appId, "public", "data", "counters", "bills");
+  const year = new Date().getFullYear();
+
+  const result = await runTransaction(db, async (tx) => {
+    const snap = await tx.get(counterRef);
+    const data = snap.exists() ? snap.data() : {};
+    const currYear = data.year || year;
+    let seq = Number(data.seq || 0);
+
+    if (currYear !== year) seq = 0;
+    seq += 1;
+
+    tx.set(counterRef, { year, seq }, { merge: true });
+
+    return `BILL-${year}-${String(seq).padStart(4, "0")}`;
+  });
+
+  return result;
+};
+
+
+
+const createInvoiceDraft = async ({ customerName = "", items = [] } = {}) => {
+  const invoiceNumber = await nextInvoiceNumber();
+
+  const subtotal = (items || []).reduce(
+    (s, it) => s + Number(it.price || 0) * Number(it.qty || 0),
+    0
+  );
+
+  const tax = 0; // لاحقًا نخليها من VAT
+  const total = subtotal + tax;
+
+  const docData = {
+  invoiceNumber,
+  status: "draft",
+
+  // 👇 هذا السطر الجديد
+  customerId: null,
+
+  // هذا موجود عندك، خليه
+  customerName: customerName || "",
+
+  items,
+  subtotal,
+  taxAmount: tax,
+  total,
+  createdAt: Date.now(),
+  paidAt: null,
+  accountingPosted: false,
+  accountingPostedAt: null,
+};
+
+
+  const ref = await addDoc(
+    collection(db, "artifacts", appId, "public", "data", "invoices"),
+    docData
+  );
+
+  return ref.id;
+};
+
+
+const saveAccSettings = async () => {
+  await setDoc(
+    doc(db, "artifacts", appId, "public", "data", "settings", "accounting"),
+    accSettings,
+    { merge: true }
+  );
+  alert("تم حفظ إعدادات المحاسبة");
+};
+
+
+
+
+
  const markOrder = async (orderId, status) => {
   try {
     const orderRef = doc(db, "artifacts", appId, "public", "data", "orders", orderId);
@@ -1724,8 +2906,26 @@ const invMap = new Map((inventory || []).map((x) => [x.id, x])); // ✅ يشمل
     }
 
     // ✅ prepared: خصم المخزون + تحديث الطلب داخل Transaction
-    const activeInvMap = new Map(activeInventory.map((x) => [x.id, x]));
     await runTransaction(db, async (tx) => {
+
+      // ✅ بعد نجاح Transaction (خصم المخزون + تحديث الطلب)
+const orderRefAfter = doc(db, "artifacts", appId, "public", "data", "orders", orderId);
+const snap = await getDoc(orderRefAfter);
+if (!snap.exists()) return;
+
+const fresh = { ...(snap.data() || {}), id: orderId };
+
+// ✅ منع الترحيل المحاسبي مرتين
+if (!fresh.accountingPosted) {
+  await postSalesEntryForOrder(fresh);
+
+  await updateDoc(orderRefAfter, {
+    accountingPosted: true,
+    accountingPostedAt: Date.now(),
+  });
+}
+
+
       const orderSnap = await tx.get(orderRef);
       if (!orderSnap.exists()) throw new Error("Order not found");
 
@@ -1769,14 +2969,8 @@ const invMap = new Map((inventory || []).map((x) => [x.id, x])); // ✅ يشمل
         
         for (const ing of recipe) {
           const invId = ing.invId;
-          const invObj = activeInvMap.get(invId);
-
-// ✅ إذا العنصر غير موجود في المخزون الفعّال => يعني "هدر" أو محذوف => تجاهله
-if (!invObj) continue;
-
-// ✅ عناصر "none" لا تُخصم
-if (invObj.unit === "none") continue;
-
+          const invObj = inventory.find((x) => x.id === invId);
+if (invObj?.unit === "none") continue;
 
 
           const needForOne = Number(ing.amountPerOne || 0);
@@ -1807,7 +3001,6 @@ deductionMap.set(invId, rec);
      // 2) ✅ لازم نقرأ كل المخزون أولاً (بدون أي كتابة)
 const invReads = [];
 for (const [invId, info] of deductionMap.entries()) {
-  if (!activeInvMap.has(invId)) continue;
   const totalNeed = info.totalNeed;
   const reason = info.reasons?.[0];
 
@@ -2136,7 +3329,7 @@ const totalWithTax = total + taxAmount;
 
     
 
-    await addDoc(colRef("orders"), {
+    await addDoc(collection(db, "artifacts", appId, "public", "data", "orders"), {
       table: orderTable,
       items,
       subtotal,
@@ -2155,7 +3348,6 @@ const totalWithTax = total + taxAmount;
   paymentMethod: orderPay,
   status: "new",
   timestamp: Date.now(),
-    branchId: branchId || "",
     });
 
     // reset
@@ -2332,24 +3524,6 @@ const adminLogin = async () => {
   setAdminAuthError("");
   setIsOwner(false);
 
-
- // ✅ إذا ما فيه فروع أصلاً لا تجبره يختار
-if (branches.length > 0 && !branchPick) {
-  setAdminAuthError("اختر الفرع أولاً");
-  return;
-}
-
-
-if (branchPick) {
-  setBranchId(branchPick);
-  localStorage.setItem("wingi_branch_id", branchPick);
-} else {
-  setBranchId(""); // النظام القديم بدون فروع
-  localStorage.removeItem("wingi_branch_id");
-}
-
-
-
   if (!adminUsername || !adminPassword) {
     setAdminAuthError(admT.requiredFields);
     return;
@@ -2378,24 +3552,18 @@ if (branchPick) {
     const ownerP = normalizeDigits(owner.ownerPassword || "12344321").trim();
 
     // ✅ Owner login
-if (u === ownerU) {
-  if (p !== ownerP) {
-    setAdminAuthError(admT.invalidCredentials);
-    return;
-  }
+    if (u === ownerU) {
+      if (p !== ownerP) {
+        setAdminAuthError(admT.invalidCredentials);
+        return;
+      }
 
-  const session = { username: ownerU, role: "owner" };
-  setAdminSession(session);
-  setIsOwner(true);
-
-  // ✅ حفظ الفرع
-  setBranchId(branchPick);
-  localStorage.setItem("wingi_branch_id", branchPick);
-
-  localStorage.setItem("wingi_admin_session", JSON.stringify(session));
-  return;
-}
-
+      const session = { username: ownerU, role: "owner" };
+      setAdminSession(session);
+      setIsOwner(true);
+      localStorage.setItem("wingi_admin_session", JSON.stringify(session));
+      return;
+    }
 
     // ✅ Staff login
     const staffRef = doc(db, ...adminUsersColPath, u);
@@ -2412,17 +3580,10 @@ if (u === ownerU) {
       return;
     }
 
-    // ✅ Staff login
-const session = { username: u, role: "staff" };
-setAdminSession(session);
-setIsOwner(false);
-
-// ✅ حفظ الفرع
-setBranchId(branchPick);
-localStorage.setItem("wingi_branch_id", branchPick);
-
-localStorage.setItem("wingi_admin_session", JSON.stringify(session));
-
+    const session = { username: u, role: "staff" };
+    setAdminSession(session);
+    setIsOwner(false);
+    localStorage.setItem("wingi_admin_session", JSON.stringify(session));
   } catch (e) {
     console.error(e);
     setAdminAuthError("Error");
@@ -2621,50 +3782,33 @@ const getPayLabel = (pm) => {
               {adminAuthMode === "login" ? admT.adminLogin : admT.adminRegister}
             </h2>
 
-           <div className="space-y-3 mt-6">
+            <div className="space-y-3 mt-6">
+              <input
+                value={adminUsername}
+                onChange={(e) => setAdminUsername(e.target.value)}
+                placeholder={admT.username}
+                className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
+              />
 
-  {/* ✅ اختيار الفرع */}
-  <select
-    value={branchPick}
-    onChange={(e) => setBranchPick(e.target.value)}
-    className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white font-black"
-  >
-    <option value="">اختر الفرع</option>
-    {branches.map((b) => (
-      <option key={b.id} value={b.id}>
-        {b.name || b.id}
-      </option>
-    ))}
-  </select>
+              <input
+                value={adminPassword}
+                onChange={(e) => setAdminPassword(e.target.value)}
+                placeholder={admT.password}
+                type="password"
+                className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
+              />
 
-  {/* اسم المستخدم */}
-  <input
-    value={adminUsername}
-    onChange={(e) => setAdminUsername(e.target.value)}
-    placeholder={admT.username}
-    className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
-  />
 
-  {/* كلمة المرور */}
-  <input
-    value={adminPassword}
-    onChange={(e) => setAdminPassword(e.target.value)}
-    placeholder={admT.password}
-    type="password"
-    className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
-  />
+              {adminAuthMode === "register" && (
+                <input
+                  value={ownerPin}
+                  onChange={(e) => setOwnerPin(e.target.value)}
+                  placeholder={admT.ownerPin}
+                  type="password"
+                  className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
+                />
+              )}
 
-  {adminAuthMode === "register" && (
-    <input
-      value={ownerPin}
-      onChange={(e) => setOwnerPin(e.target.value)}
-      placeholder={admT.ownerPin}
-      type="password"
-      className="w-full p-4 rounded-2xl bg-white/10 border border-white/10 text-white outline-none"
-    />
-  )}
-
-              
               {adminAuthError && (
                 <div className="bg-red-500/20 border border-red-500/30 text-red-100 p-3 rounded-2xl text-sm font-bold">
                   {adminAuthError}
@@ -2840,43 +3984,6 @@ const getPayLabel = (pm) => {
    <main className="p-6 max-w-[1900px] mx-auto w-full">
   <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
 
-
-
-
-
-{/* ✅ Branch Picker للأدمن */}
-{appMode === "admin" && adminSession && branches.length > 0 && !branchId && (
-  <div className="fixed inset-0 bg-black/40 z-[200] flex items-center justify-center p-4">
-    <div className="bg-white w-full max-w-md rounded-3xl p-6 border">
-      <div className="text-xl font-black mb-2">اختر الفرع</div>
-      <div className="text-sm text-slate-600 mb-4">
-        المينيو مشترك، لكن الطلبات/المخزون/الإيرادات ستكون منفصلة لكل فرع.
-      </div>
-
-      <select
-        className="w-full border rounded-2xl p-3 font-bold"
-        defaultValue=""
-        onChange={(e) => setBranchId(e.target.value)}
-      >
-        <option value="">(بدون فرع - النظام القديم)</option>
-        {branches.map((b) => (
-          <option key={b.id} value={b.id}>
-            {b.name}
-          </option>
-        ))}
-      </select>
-
-      <button
-        className="w-full mt-4 bg-slate-950 text-white py-3 rounded-2xl font-black"
-        onClick={() => setShowBranchPicker(false)}
-      >
-        دخول
-      </button>
-    </div>
-  </div>
-)}
-
-
     {/* ===== SIDEBAR ===== */}
     <aside className="xl:col-span-3">
       <div className="bg-white rounded-[2rem] border p-4 sticky top-[92px]">
@@ -2924,108 +4031,144 @@ const getPayLabel = (pm) => {
       ? "bg-slate-950 text-white"
       : "bg-slate-50 text-slate-700"
   }`}
-
-
 >
-
-  
   💰 الإيرادات والإخراجات
 </button>
 
 
 <button
-  onClick={() => setAdminPage("branches")}
+  onClick={() => setAdminPage("accounting")}
   className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
-    adminPage === "branches"
+    adminPage === "accounting"
       ? "bg-slate-950 text-white"
       : "bg-slate-50 text-slate-700"
   }`}
 >
-  🏪 الفروع
+  📘 المحاسبة (قيود يومية)
 </button>
+
+
+<button
+  onClick={() => setAdminPage("reports")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "reports"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  📊 التقارير
+</button>
+
+
+<button
+  onClick={() => setAdminPage("balanceSheet")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "balanceSheet"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  📊 الميزانية العمومية
+</button>
+
+
+<button
+  onClick={() => setAdminPage("cashFlow")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "cashFlow"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  💧 التدفقات النقدية
+</button>
+
+
+
+
+<button
+  onClick={() => setAdminPage("invoices")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "invoices"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  🧾 الفواتير
+</button>
+
+
+<button
+  onClick={() => setAdminPage("customers")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "customers"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  👥 العملاء
+</button>
+
+
+<button
+  onClick={() => setAdminPage("vendors")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "vendors"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  🏭 الموردون
+</button>
+
+
+<button
+  onClick={() => setAdminPage("bills")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "bills"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  🧾 فواتير المشتريات
+</button>
+
+
+<button
+  onClick={() => setAdminPage("vendorPayments")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "vendorPayments"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  💸 سندات صرف الموردين
+</button>
+
+
+
+
+
+
+<button
+  onClick={() => setAdminPage("settings")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "settings"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  ⚙️ إعدادات المحاسبة
+</button>
+
+
+
 
       </div>
     </aside>
 
     {/* ===== CONTENT ===== */}
     <section className="xl:col-span-9 space-y-6">
-
-
-
-{adminPage === "branches" && (
-  <div className="space-y-6">
-    <h2 className="text-xl font-black">🏪 الفروع</h2>
-
-    <div className="bg-white p-4 rounded-2xl border space-y-3">
-      <div className="font-black">إضافة فرع جديد</div>
-      <div className="flex gap-3">
-        <input
-          value={newBranchName}
-          onChange={(e) => setNewBranchName(e.target.value)}
-          className="flex-grow border rounded-2xl p-3 font-bold"
-          placeholder="اسم الفرع (مثال: فرع الفاتح)"
-        />
-        <button
-          className="bg-slate-950 text-white px-5 rounded-2xl font-black"
-          onClick={async () => {
-            const name = (newBranchName || "").trim();
-            if (!name) return;
-            await addDoc(
-              collection(db, "artifacts", appId, "public", "data", "branches"),
-              { name, createdAt: Date.now() }
-            );
-            setNewBranchName("");
-          }}
-        >
-          إضافة
-        </button>
-      </div>
-    </div>
-
-    <div className="bg-white p-4 rounded-2xl border">
-      <div className="font-black mb-3">قائمة الفروع</div>
-
-      {branches.length === 0 ? (
-        <div className="text-slate-500 font-bold">لا يوجد فروع.</div>
-      ) : (
-        <div className="space-y-3">
-          {branches.map((b) => (
-            <div
-              key={b.id}
-              className="flex items-center justify-between border rounded-2xl p-3"
-            >
-              <div className="font-black">{b.name}</div>
-
-              <div className="flex items-center gap-2">
-                <button
-                  className={`px-4 py-2 rounded-xl font-black ${
-                    branchId === b.id ? "bg-emerald-600 text-white" : "bg-slate-100"
-                  }`}
-                  onClick={() => setBranchId(b.id)}
-                >
-                  اختيار
-                </button>
-
-                <button
-                  className="px-4 py-2 rounded-xl font-black bg-rose-600 text-white"
-                  onClick={async () => {
-                    // حذف الفرع (ملاحظة: لن يحذف بياناته الفرعية تلقائيًا)
-                    await deleteDoc(
-                      doc(db, "artifacts", appId, "public", "data", "branches", b.id)
-                    );
-                    if (branchId === b.id) setBranchId("");
-                  }}
-                >
-                  حذف
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  </div>
-)}
 
       {/* ============ MENU ============ */}
       {adminPage === "menu" && (
@@ -3395,47 +4538,6 @@ const getPayLabel = (pm) => {
         <div className="space-y-6">
           <h2 className="text-xl font-black">المخزون</h2>
 
-
-<div className="bg-white p-4 rounded-2xl border">
-  <h3 className="font-black mb-3">🗑️ الهدر</h3>
-
-  {wasteInventory.length === 0 ? (
-    <div className="p-4 rounded-2xl bg-slate-50 text-slate-500 font-bold">
-      لا يوجد عناصر هدر
-    </div>
-  ) : (
-    <div className="space-y-2">
-      {wasteInventory.map((inv) => (
-        <div
-          key={inv.id}
-          className="p-4 rounded-2xl border flex justify-between items-center"
-        >
-          <div>
-            <div className="font-black">{inv.name}</div>
-            <div className="text-xs text-slate-500 font-bold">
-              آخر كمية: {inv.quantity} {inv.unit}
-            </div>
-          </div>
-
-          <button
-            onClick={async () => {
-              const ok = confirm("حذف نهائي من الهدر؟");
-              if (!ok) return;
-
-              await deleteDoc(
-                doc(db, "artifacts", appId, "public", "data", "inventory", inv.id)
-              );
-            }}
-            className="px-4 py-2 rounded-xl bg-red-600 text-white font-black hover:bg-red-500"
-          >
-            حذف
-          </button>
-        </div>
-      ))}
-    </div>
-  )}
-</div>
-
           {/* نموذج الإضافة */}
           <div className="bg-white p-4 rounded-2xl border space-y-3">
             <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
@@ -3511,7 +4613,7 @@ const getPayLabel = (pm) => {
               </div>
             ) : (
               <div className="space-y-2">
-                {activeInventory.map((inv) => (
+                {inventory.map((inv) => (
                   <div
                     key={inv.id}
                     className="p-4 rounded-2xl border flex justify-between items-center"
@@ -3522,57 +4624,6 @@ const getPayLabel = (pm) => {
                     >
                       تعديل
                     </button>
-
-
-                    <button
-  onClick={async () => {
-    const ok = confirm("تحويل هذا العنصر إلى الهدر؟");
-    if (!ok) return;
-
-    try {
-      await runTransaction(db, async (tx) => {
-        const invRef = doc(db, "artifacts", appId, "public", "data", "inventory", inv.id);
-        const snap = await tx.get(invRef);
-        if (!snap.exists()) return;
-
-        const data = snap.data() || {};
-        const qty = Number(data.quantity || 0);
-        const unit = data.unit || "none";
-
-        // ✅ انت تستخدم costPrice بالمخزون
-        const costPerUnit = Number(data.costPrice || 0);
-        const totalCost = qty * costPerUnit;
-
-        // 1) علّم العنصر أنه هدر
-        tx.set(invRef, { isWaste: true, wasteAt: Date.now() }, { merge: true });
-
-        // 2) سجل الهدر بالتاريخ داخل wasteLogs
-        const logRef = doc(
-         colRef("wasteLogs")
-        );
-
-        tx.set(logRef, {
-          invId: inv.id,
-          name: data.name || inv.name || inv.id,
-          qty,
-          unit,
-          costPerUnit,
-          totalCost,
-          timestamp: Date.now(),
-          createdBy: adminSession?.username || "unknown",
-        });
-      });
-    } catch (e) {
-      console.error(e);
-      alert("فشل تحويل للهدر");
-    }
-  }}
-  className="px-4 py-2 rounded-xl bg-amber-100 text-amber-800 font-black"
->
-  الهدر
-</button>
-
-
 
                     <div>
                       <div className="font-black">{inv.name}</div>
@@ -3618,30 +4669,8 @@ const getPayLabel = (pm) => {
   تصدير المخزون إلى Excel
 </button>
 
-    <h2 className="text-xl font-black">💰 الإيرادات والإخراجات</h2>
-
-    {/* الفلتر */}
-    <div className="bg-white p-4 rounded-2xl border flex gap-3 flex-wrap">
-      <button
-        onClick={() => setFinanceMode("daily")}
-        className={`px-4 py-2 rounded-xl font-black ${
-          financeMode === "daily" ? "bg-black text-white" : "bg-slate-100"
-        }`}
-      >
-        يومي
-      </button>
-
-      <button
-        onClick={() => setFinanceMode("range")}
-        className={`px-4 py-2 rounded-xl font-black ${
-          financeMode === "range" ? "bg-black text-white" : "bg-slate-100"
-        }`}
-      >
-        فترة
-      </button>
-
-
-<div className="bg-white p-4 rounded-2xl border">
+    
+    <div className="bg-white p-4 rounded-2xl border">
   <h3 className="font-black mb-3">📦 إجمالي استخدام المخزون</h3>
 
   <table className="w-full">
@@ -3666,80 +4695,51 @@ const getPayLabel = (pm) => {
   </table>
 </div>
 
+    <h2 className="text-xl font-black">💰 الإيرادات والإخراجات</h2>
 
+    {/* الفلتر */}
+    <div className="bg-white p-4 rounded-2xl border flex gap-3 flex-wrap">
+      <button
+        onClick={() => setFinanceMode("daily")}
+        className={`px-4 py-2 rounded-xl font-black ${
+          financeMode === "daily" ? "bg-black text-white" : "bg-slate-100"
+        }`}
+      >
+        يومي
+      </button>
 
-{/* 🗑️ الهدر */}
-<div className="bg-white p-4 rounded-2xl border">
-  <div className="flex items-center justify-between mb-3">
-    <h3 className="font-black">🗑️ الهدر (حسب التاريخ)</h3>
-    <div className="font-black text-red-600">
-      إجمالي الهدر: {wasteTotal.toFixed(2)} TL
-    </div>
-  </div>
-
-  {filteredWasteLogs.length === 0 ? (
-    <div className="p-4 rounded-2xl bg-slate-50 text-slate-500 font-bold">
-      لا يوجد هدر في هذه الفترة
-    </div>
-  ) : (
-    <div className="space-y-2">
-      {filteredWasteLogs.map((w) => (
-        <div
-          key={w.id}
-          className="p-4 rounded-2xl border flex justify-between items-center"
-        >
-          <div>
-            <div className="font-black">{w.name}</div>
-            <div className="text-xs text-slate-500 font-bold">
-              الكمية: {w.qty} {w.unit} — التكلفة:{" "}
-              {Number(w.totalCost || 0).toFixed(2)} TL
-            </div>
-            <div className="text-xs text-slate-400 font-bold">
-              {w.timestamp
-                ? new Date(w.timestamp).toLocaleString()
-                : ""}
-            </div>
-          </div>
-        </div>
-      ))}
-    </div>
-  )}
-</div>
+      <button
+        onClick={() => setFinanceMode("range")}
+        className={`px-4 py-2 rounded-xl font-black ${
+          financeMode === "range" ? "bg-black text-white" : "bg-slate-100"
+        }`}
+      >
+        فترة
+      </button>
 
       {financeMode === "daily" ? (
-  <div>
-    <div className="text-xs font-black text-slate-500 mb-1">التاريخ</div>
-    <input
-      type="date"
-      value={finDate}
-      onChange={(e) => setFinDate(e.target.value)}
-      className="border rounded-xl px-3 py-2"
-    />
-  </div>
-) : (
-  <>
-    <div>
-      <div className="text-xs font-black text-slate-500 mb-1">من تاريخ</div>
-      <input
-        type="date"
-        value={finFrom}
-        onChange={(e) => setFinFrom(e.target.value)}
-        className="border rounded-xl px-3 py-2"
-      />
-    </div>
-
-    <div>
-      <div className="text-xs font-black text-slate-500 mb-1">إلى تاريخ</div>
-      <input
-        type="date"
-        value={finTo}
-        onChange={(e) => setFinTo(e.target.value)}
-        className="border rounded-xl px-3 py-2"
-      />
-    </div>
-  </>
-)}
-
+        <input
+          type="date"
+          value={finDate}
+          onChange={(e) => setFinDate(e.target.value)}
+          className="border rounded-xl px-3 py-2"
+        />
+      ) : (
+        <>
+          <input
+            type="date"
+            value={finFrom}
+            onChange={(e) => setFinFrom(e.target.value)}
+            className="border rounded-xl px-3 py-2"
+          />
+          <input
+            type="date"
+            value={finTo}
+            onChange={(e) => setFinTo(e.target.value)}
+            className="border rounded-xl px-3 py-2"
+          />
+        </>
+      )}
     </div>
 
     {/* الإجمالي */}
@@ -3793,6 +4793,1170 @@ const getPayLabel = (pm) => {
 </div>
   </div>
 )}
+
+
+
+{adminPage === "accounting" && (
+  <div className="space-y-6">
+    <div className="flex items-center justify-between gap-3">
+      <h2 className="text-xl font-black">📘 المحاسبة</h2>
+      <div className="text-sm font-bold text-slate-500">
+        آخر القيود: {journalEntries.length}
+      </div>
+    </div>
+
+    <div className="bg-white p-4 rounded-2xl border">
+      <div className="font-black mb-3">قيود اليومية</div>
+
+      <button
+  onClick={() => exportJournalPDF()}
+  className="px-5 py-3 rounded-2xl bg-slate-950 text-white font-black"
+>
+  🧾 تصدير PDF (قيود اليومية)
+</button>
+
+
+      {journalEntries.length === 0 ? (
+        <div className="text-sm text-slate-500 font-bold">
+          لا يوجد قيود بعد. جرّب “تم التحضير” لطلب جديد.
+        </div>
+      ) : (
+        <div className="overflow-auto">
+          <table className="w-full min-w-[800px]">
+            <thead>
+              <tr className="text-sm text-slate-500">
+                <th className="text-right p-2">التاريخ</th>
+                <th className="text-right p-2">الوصف</th>
+                <th className="text-right p-2">المرجع</th>
+                <th className="text-right p-2">الإجمالي</th>
+                <th className="text-right p-2">بنود</th>
+              </tr>
+            </thead>
+            <tbody>
+              {journalEntries.map((j) => {
+  const total = Number(j.totalDebit || 0);
+  const linesCount = Array.isArray(j.lines) ? j.lines.length : 0;
+
+  return (
+    <React.Fragment key={j.id}>
+      {/* صف القيد */}
+      <tr
+        className="border-t cursor-pointer hover:bg-slate-50"
+        onClick={() =>
+          setOpenJournalId((p) => (p === j.id ? null : j.id))
+        }
+      >
+        <td className="p-2 font-bold">{j.date || "-"}</td>
+
+        <td className="p-2 font-bold">
+          طلب بيع <span dir="ltr">{j.refText}</span>
+        </td>
+
+        <td className="p-2 text-sm text-slate-600 font-bold">
+          <span className="opacity-70">order</span>{" "}
+          <span dir="ltr" className="font-mono">#{j.refId}</span>
+        </td>
+
+        <td className="p-2 font-black">
+          {Number.isFinite(total) ? total.toFixed(2) : "0.00"} {CURRENCY}
+        </td>
+
+        <td className="p-2 text-sm text-slate-600 font-bold">
+          {linesCount} بند
+        </td>
+      </tr>
+
+      {/* 🔽 تفاصيل القيد */}
+      {openJournalId === j.id && (
+        <tr className="bg-slate-50">
+          <td colSpan={5} className="p-3">
+            <div className="font-black mb-2">تفاصيل القيد</div>
+
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-slate-500">
+                  <th className="text-right p-2">الحساب</th>
+                  <th className="text-right p-2">مدين</th>
+                  <th className="text-right p-2">دائن</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(j.lines || []).map((l, idx) => (
+                  <tr key={idx} className="border-t">
+                    <td className="p-2 font-bold">
+                      {getAccLabel(l.accountId, accSettings, lang)}
+                    </td>
+                    <td className="p-2 font-black" dir="ltr">
+                      {Number(l.debit || 0).toFixed(2)}
+                    </td>
+                    <td className="p-2 font-black" dir="ltr">
+                      {Number(l.credit || 0).toFixed(2)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </td>
+        </tr>
+      )}
+    </React.Fragment>
+  );
+})}
+
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  </div>
+)}
+
+{adminPage === "reports" && (
+  <div className="space-y-6">
+    <h2 className="text-xl font-black">📊 التقارير</h2>
+
+    <div className="bg-white p-4 rounded-2xl border">
+      <div className="font-black mb-2">تقارير المبيعات والضريبة</div>
+      <div className="text-sm text-slate-500 font-bold">
+        (قريبًا: تقرير يومي/شهري + VAT + ميزان مراجعة)
+      </div>
+    </div>
+  </div>
+)}
+
+
+
+{adminPage === "reports" && (
+  <ReportsPanel
+  journalEntries={journalEntries}
+  CURRENCY={CURRENCY}
+  accSettings={accSettings}
+  accounts={accounts}
+  lang={lang}
+/>
+
+)}
+
+{adminPage === "invoices" && (
+  <div className="space-y-6">
+    <div className="flex items-center justify-between">
+      <h2 className="text-xl font-black">🧾 الفواتير</h2>
+
+      <button
+        onClick={async () => {
+          const id = await createInvoiceDraft({ customerName: "" , items: []});
+          alert("تم إنشاء فاتورة مسودة ✅");
+          // لو تبي: افتحها مباشرة
+        }}
+        className="px-5 py-3 rounded-2xl bg-emerald-600 text-white font-black"
+      >
+        + فاتورة جديدة
+      </button>
+    </div>
+
+    <div className="bg-white p-4 rounded-2xl border">
+      <div className="font-black mb-3">قائمة الفواتير</div>
+
+      {invoices.length === 0 ? (
+        <div className="text-sm text-slate-500 font-bold">لا يوجد فواتير بعد.</div>
+      ) : (
+        <div className="overflow-auto">
+
+          <div className="text-xs text-slate-500 font-bold mb-2" dir="ltr">
+  customers: {customers?.length || 0}
+</div>
+
+          <table className="w-full min-w-[900px]">
+            <thead>
+              <tr className="text-sm text-slate-500">
+                <th className="text-right p-2">رقم</th>
+                <th className="text-right p-2">العميل</th>
+                <th className="text-right p-2">الحالة</th>
+                <th className="text-right p-2">الإجمالي</th>
+                <th className="text-right p-2">تاريخ</th>
+                <th className="text-right p-2">إجراء</th>
+
+              </tr>
+            </thead>
+            <tbody>
+              {invoices.map((inv) => (
+                <tr key={inv.id} className="border-t">
+                  <td className="p-2 font-black" dir="ltr">{inv.invoiceNumber}</td>
+                  <td className="p-2">
+  <select
+    className="w-full border rounded-xl px-3 py-2 font-bold"
+    value={inv.customerId || ""}
+    onChange={async (e) => {
+      const cid = e.target.value;
+      const c = customers.find((x) => x.id === cid);
+
+      await updateDoc(
+        doc(db, "artifacts", appId, "public", "data", "invoices", inv.id),
+        {
+          customerId: cid || null,
+          customerName: c?.name || "",
+        }
+      );
+    }}
+  >
+    <option value="">— بدون عميل —</option>
+    {customers.map((c) => (
+      <option key={c.id} value={c.id}>
+        {c.name}
+      </option>
+    ))}
+  </select>
+</td>
+
+
+                  <td className="p-2 font-bold">{inv.status}</td>
+                  <td className="p-2 font-black">
+                    {Number(inv.total || 0).toFixed(2)} {CURRENCY}
+                  </td>
+                  <td className="p-2 font-bold">
+                    {inv.createdAt ? new Date(inv.createdAt).toISOString().slice(0,10) : "-"}
+                  </td>
+                  <td className="p-2">
+  {inv.status !== "paid" ? (
+    <button
+      onClick={async () => {
+        if (inv.accountingPosted) return alert("تم ترحيلها سابقًا ✅");
+
+        await postSalesEntryForInvoice({ ...inv, id: inv.id });
+
+        await updateDoc(
+          doc(db, "artifacts", appId, "public", "data", "invoices", inv.id),
+          {
+            status: "paid",
+            paidAt: Date.now(),
+            accountingPosted: true,
+            accountingPostedAt: Date.now(),
+          }
+        );
+
+        alert("تم دفع الفاتورة وترحيلها محاسبيًا ✅");
+      }}
+      className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-black"
+    >
+      Paid
+    </button>
+  ) : (
+    <span className="text-xs font-black text-emerald-700">مدفوعة</span>
+  )}
+</td>
+
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  </div>
+)}
+
+
+{adminPage === "customers" && (
+  <div className="space-y-6">
+    <div className="flex items-center justify-between">
+      <h2 className="text-xl font-black">👥 العملاء</h2>
+
+      <button
+        onClick={() =>
+          setEditingCustomer({
+            name: "",
+            phone: "",
+            taxNo: "",
+            address: "",
+            active: true,
+          })
+        }
+        className="px-5 py-3 rounded-2xl bg-emerald-600 text-white font-black"
+      >
+        + عميل جديد
+      </button>
+    </div>
+
+    {/* نموذج إضافة/تعديل عميل */}
+    {editingCustomer && (
+      <div className="bg-white p-4 rounded-2xl border space-y-3">
+        <div className="font-black">بيانات العميل</div>
+
+        <input
+          className="w-full border rounded-xl px-4 py-3 font-bold"
+          placeholder="اسم العميل"
+          value={editingCustomer.name}
+          onChange={(e) => setEditingCustomer((p) => ({ ...p, name: e.target.value }))}
+        />
+
+        <input
+          className="w-full border rounded-xl px-4 py-3 font-bold"
+          placeholder="الهاتف"
+          value={editingCustomer.phone}
+          onChange={(e) => setEditingCustomer((p) => ({ ...p, phone: e.target.value }))}
+          dir="ltr"
+        />
+
+        <input
+          className="w-full border rounded-xl px-4 py-3 font-bold"
+          placeholder="الرقم الضريبي (اختياري)"
+          value={editingCustomer.taxNo}
+          onChange={(e) => setEditingCustomer((p) => ({ ...p, taxNo: e.target.value }))}
+          dir="ltr"
+        />
+
+        <textarea
+          className="w-full border rounded-xl px-4 py-3 font-bold"
+          placeholder="العنوان (اختياري)"
+          value={editingCustomer.address}
+          onChange={(e) => setEditingCustomer((p) => ({ ...p, address: e.target.value }))}
+          rows={3}
+        />
+
+        <div className="flex gap-2">
+          <button
+            onClick={async () => {
+              const data = {
+                ...editingCustomer,
+                name: String(editingCustomer.name || "").trim(),
+              };
+              if (!data.name) return alert("اكتب اسم العميل");
+
+              if (data.id) {
+                await updateDoc(
+                  doc(db, "artifacts", appId, "public", "data", "customers", data.id),
+                  data
+                );
+              } else {
+                await addDoc(
+                  collection(db, "artifacts", appId, "public", "data", "customers"),
+                  { ...data, createdAt: Date.now() }
+                );
+              }
+              setEditingCustomer(null);
+            }}
+            className="px-5 py-3 rounded-2xl bg-slate-950 text-white font-black"
+          >
+            حفظ
+          </button>
+
+          <button
+            onClick={() => setEditingCustomer(null)}
+            className="px-5 py-3 rounded-2xl bg-slate-100 text-slate-700 font-black"
+          >
+            إلغاء
+          </button>
+        </div>
+      </div>
+    )}
+
+    {/* جدول العملاء */}
+    <div className="bg-white p-4 rounded-2xl border">
+      <div className="font-black mb-3">قائمة العملاء</div>
+
+      {customers.length === 0 ? (
+        <div className="text-sm text-slate-500 font-bold">لا يوجد عملاء بعد.</div>
+      ) : (
+        <div className="overflow-auto">
+          <table className="w-full min-w-[900px]">
+            <thead>
+              <tr className="text-sm text-slate-500">
+                <th className="text-right p-2">الاسم</th>
+                <th className="text-right p-2">الهاتف</th>
+                <th className="text-right p-2">الضريبي</th>
+                <th className="text-right p-2">إجراء</th>
+              </tr>
+            </thead>
+            <tbody>
+              {customers.map((c) => (
+                <tr key={c.id} className="border-t">
+                  <td className="p-2 font-black">{c.name}</td>
+                  <td className="p-2 font-bold" dir="ltr">{c.phone || "-"}</td>
+                  <td className="p-2 font-bold" dir="ltr">{c.taxNo || "-"}</td>
+                  <td className="p-2">
+                    <button
+                      onClick={() => setEditingCustomer({ ...c, id: c.id })}
+                      className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
+                    >
+                      تعديل
+                    </button>
+
+                    <button
+  onClick={() => {
+    setSelectedCustomerId(c.id);
+    setAdminPage("customer_ledger");
+  }}
+  className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-black mr-2"
+>
+  كشف حساب
+</button>
+
+
+<button
+  onClick={() => setAdminPage("customer_ledger")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "customer_ledger"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  📒 كشف حساب عميل
+</button>
+
+
+<button
+  onClick={() => setAdminPage("receipts")}
+  className={`w-full mt-3 px-4 py-3 rounded-2xl font-black text-right ${
+    adminPage === "receipts"
+      ? "bg-slate-950 text-white"
+      : "bg-slate-50 text-slate-700"
+  }`}
+>
+  💵 سندات القبض
+</button>
+
+
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  </div>
+)}
+
+
+
+
+
+{adminPage === "vendors" && (
+  <div className="space-y-6">
+    <div className="flex items-center justify-between">
+      <h2 className="text-xl font-black">🏭 الموردون</h2>
+
+      <button
+        onClick={() =>
+          setEditingVendor({
+            name: "",
+            phone: "",
+            taxNo: "",
+            address: "",
+            active: true,
+          })
+        }
+        className="px-5 py-3 rounded-2xl bg-emerald-600 text-white font-black"
+      >
+        + مورد جديد
+      </button>
+    </div>
+
+    {editingVendor && (
+      <div className="bg-white p-4 rounded-2xl border space-y-3">
+        <input
+          className="w-full border rounded-xl px-4 py-3 font-bold"
+          placeholder="اسم المورد"
+          value={editingVendor.name}
+          onChange={(e) => setEditingVendor((p) => ({ ...p, name: e.target.value }))}
+        />
+
+        <input
+          className="w-full border rounded-xl px-4 py-3 font-bold"
+          placeholder="الهاتف"
+          value={editingVendor.phone}
+          onChange={(e) => setEditingVendor((p) => ({ ...p, phone: e.target.value }))}
+          dir="ltr"
+        />
+
+        <button
+          onClick={async () => {
+            if (!editingVendor.name) return alert("اكتب اسم المورد");
+
+            if (editingVendor.id) {
+              await updateDoc(
+                doc(db, "artifacts", appId, "public", "data", "vendors", editingVendor.id),
+                editingVendor
+              );
+            } else {
+              await addDoc(
+                collection(db, "artifacts", appId, "public", "data", "vendors"),
+                { ...editingVendor, createdAt: Date.now() }
+              );
+            }
+            setEditingVendor(null);
+          }}
+          className="px-5 py-3 rounded-2xl bg-slate-950 text-white font-black"
+        >
+          حفظ
+        </button>
+      </div>
+    )}
+
+    <div className="bg-white p-4 rounded-2xl border">
+      <div className="font-black mb-3">قائمة الموردين</div>
+
+      <table className="w-full">
+        <thead>
+          <tr className="text-sm text-slate-500">
+            <th className="text-right p-2">الاسم</th>
+            <th className="text-right p-2">الهاتف</th>
+          </tr>
+        </thead>
+        <tbody>
+          {vendors.map((v) => (
+            <tr key={v.id} className="border-t">
+              <td className="p-2 font-black">{v.name}</td>
+              <td className="p-2 font-bold" dir="ltr">{v.phone || "-"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </div>
+)}
+
+
+{adminPage === "bills" && (
+  <div className="space-y-6">
+    <div className="flex items-center justify-between">
+      <h2 className="text-xl font-black">🧾 فواتير المشتريات</h2>
+
+      <button
+        onClick={async () => {
+          const billNumber = await nextBillNumber();
+
+          await addDoc(
+            collection(db, "artifacts", appId, "public", "data", "bills"),
+            {
+              billNumber,
+              status: "draft", // draft | approved | paid | void
+              vendorId: null,
+              vendorName: "",
+              date: new Date().toISOString().slice(0, 10),
+              total: 0,
+              expenseAccountId: "expense",
+              createdAt: Date.now(),
+              accountingPosted: false,
+              accountingPostedAt: null,
+            }
+          );
+
+          alert("تم إنشاء فاتورة مشتريات مسودة ✅");
+        }}
+        className="px-5 py-3 rounded-2xl bg-emerald-600 text-white font-black"
+      >
+        + فاتورة مشتريات جديدة
+      </button>
+    </div>
+
+    <div className="bg-white p-4 rounded-2xl border">
+      <div className="font-black mb-3">قائمة فواتير المشتريات</div>
+
+      {bills.length === 0 ? (
+        <div className="text-sm text-slate-500 font-bold">لا يوجد فواتير مشتريات بعد.</div>
+      ) : (
+        <div className="overflow-auto">
+          <table className="w-full min-w-[1100px]">
+            <thead>
+              <tr className="text-sm text-slate-500">
+                <th className="text-right p-2">الرقم</th>
+                <th className="text-right p-2">المورد</th>
+                <th className="text-right p-2">التاريخ</th>
+                <th className="text-right p-2">الإجمالي</th>
+                <th className="text-right p-2">الحالة</th>
+                <th className="text-right p-2">إجراء</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bills.map((b) => (
+                <tr key={b.id} className="border-t">
+                  <td className="p-2 font-black" dir="ltr">{b.billNumber}</td>
+
+                  <td className="p-2">
+                    <select
+                      className="w-full border rounded-xl px-3 py-2 font-bold"
+                      value={b.vendorId || ""}
+                      onChange={async (e) => {
+                        const vid = e.target.value;
+                        const v = vendors.find((x) => x.id === vid);
+                        await updateDoc(
+                          doc(db, "artifacts", appId, "public", "data", "bills", b.id),
+                          { vendorId: vid || null, vendorName: v?.name || "" }
+                        );
+                      }}
+                    >
+                      <option value="">— بدون مورد —</option>
+                      {vendors.map((v) => (
+                        <option key={v.id} value={v.id}>{v.name}</option>
+                      ))}
+                    </select>
+                  </td>
+
+                  <td className="p-2">
+                    <input
+                      type="date"
+                      className="border rounded-xl px-3 py-2 font-bold"
+                      value={b.date || ""}
+                      onChange={async (e) => {
+                        await updateDoc(
+                          doc(db, "artifacts", appId, "public", "data", "bills", b.id),
+                          { date: e.target.value }
+                        );
+                      }}
+                      dir="ltr"
+                    />
+                  </td>
+
+                  <td className="p-2">
+                    <input
+                      className="border rounded-xl px-3 py-2 font-bold w-40"
+                      value={b.total ?? 0}
+                      onChange={async (e) => {
+                        const val = Number(e.target.value || 0);
+                        await updateDoc(
+                          doc(db, "artifacts", appId, "public", "data", "bills", b.id),
+                          { total: val }
+                        );
+                      }}
+                      dir="ltr"
+                    />
+                  </td>
+
+                  <td className="p-2 font-bold">{b.status}</td>
+
+                  <td className="p-2">
+                    {b.status === "draft" && (
+                      <button
+                        onClick={async () => {
+                          if (b.accountingPosted) return alert("تم ترحيلها سابقًا");
+                          if (!b.total || Number(b.total) <= 0) return alert("ضع إجمالي صحيح");
+                          await postBillEntry({ ...b, id: b.id });
+
+                          await updateDoc(
+                            doc(db, "artifacts", appId, "public", "data", "bills", b.id),
+                            {
+                              status: "approved",
+                              accountingPosted: true,
+                              accountingPostedAt: Date.now(),
+                            }
+                          );
+
+                          alert("تم اعتماد الفاتورة وترحيلها ✅");
+                        }}
+                        className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
+                      >
+                        اعتماد (Approve)
+                      </button>
+                    )}
+
+                    {b.status === "approved" && (
+                      <span className="text-xs font-black text-emerald-700">بانتظار السداد</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  </div>
+)}
+
+
+{adminPage === "vendorPayments" && (
+  <div className="space-y-6">
+    <div className="flex items-center justify-between">
+      <h2 className="text-xl font-black">💸 سندات صرف الموردين</h2>
+
+      <button
+        onClick={() =>
+          addDoc(
+            collection(db, "artifacts", appId, "public", "data", "vendor_payments"),
+            {
+              vendorId: null,
+              vendorName: "",
+              amount: 0,
+              method: "cash", // cash | bank
+              date: new Date().toISOString().slice(0, 10),
+              createdAt: Date.now(),
+              accountingPosted: false,
+            }
+          )
+        }
+        className="px-5 py-3 rounded-2xl bg-emerald-600 text-white font-black"
+      >
+        + سند صرف جديد
+      </button>
+    </div>
+
+    <div className="bg-white p-4 rounded-2xl border">
+      <table className="w-full min-w-[1000px]">
+        <thead>
+          <tr className="text-sm text-slate-500">
+            <th className="text-right p-2">المورد</th>
+            <th className="text-right p-2">المبلغ</th>
+            <th className="text-right p-2">الطريقة</th>
+            <th className="text-right p-2">التاريخ</th>
+            <th className="text-right p-2">إجراء</th>
+          </tr>
+        </thead>
+        <tbody>
+          {vendorPayments.map((p) => (
+            <tr key={p.id} className="border-t">
+              <td className="p-2">
+                <select
+                  className="w-full border rounded-xl px-3 py-2 font-bold"
+                  value={p.vendorId || ""}
+                  onChange={async (e) => {
+                    const vid = e.target.value;
+                    const v = vendors.find((x) => x.id === vid);
+                    await updateDoc(
+                      doc(db, "artifacts", appId, "public", "data", "vendor_payments", p.id),
+                      { vendorId: vid || null, vendorName: v?.name || "" }
+                    );
+                  }}
+                >
+                  <option value="">— بدون مورد —</option>
+                  {vendors.map((v) => (
+                    <option key={v.id} value={v.id}>{v.name}</option>
+                  ))}
+                </select>
+              </td>
+
+              <td className="p-2">
+                <input
+                  className="border rounded-xl px-3 py-2 font-bold w-40"
+                  value={p.amount ?? 0}
+                  onChange={async (e) => {
+                    const val = Number(e.target.value || 0);
+                    await updateDoc(
+                      doc(db, "artifacts", appId, "public", "data", "vendor_payments", p.id),
+                      { amount: val }
+                    );
+                  }}
+                  dir="ltr"
+                />
+              </td>
+
+              <td className="p-2">
+                <select
+                  className="border rounded-xl px-3 py-2 font-bold"
+                  value={p.method || "cash"}
+                  onChange={async (e) => {
+                    await updateDoc(
+                      doc(db, "artifacts", appId, "public", "data", "vendor_payments", p.id),
+                      { method: e.target.value }
+                    );
+                  }}
+                >
+                  <option value="cash">Cash</option>
+                  <option value="bank">Bank</option>
+                </select>
+              </td>
+
+              <td className="p-2">
+                <input
+                  type="date"
+                  className="border rounded-xl px-3 py-2 font-bold"
+                  value={p.date || ""}
+                  onChange={async (e) => {
+                    await updateDoc(
+                      doc(db, "artifacts", appId, "public", "data", "vendor_payments", p.id),
+                      { date: e.target.value }
+                    );
+                  }}
+                  dir="ltr"
+                />
+              </td>
+
+              <td className="p-2">
+                {!p.accountingPosted && (
+                  <button
+                    onClick={async () => {
+                      if (Number(p.amount || 0) <= 0) return alert("المبلغ غير صحيح");
+                      await postVendorPaymentEntry({ ...p, id: p.id });
+
+                      await updateDoc(
+                        doc(db, "artifacts", appId, "public", "data", "vendor_payments", p.id),
+                        {
+                          accountingPosted: true,
+                          accountingPostedAt: Date.now(),
+                        }
+                      );
+
+                      alert("تم ترحيل سند الصرف ✅");
+                    }}
+                    className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
+                  >
+                    ترحيل
+                  </button>
+                )}
+
+                {p.accountingPosted && (
+                  <span className="text-xs font-black text-emerald-700">مرحّل</span>
+                )}
+              </td>
+
+              <td className="p-2">
+  <button
+    onClick={async () => {
+      try {
+        if (Number(p.amount || 0) <= 0) return alert("المبلغ غير صحيح");
+
+        // لو مرحّل مسبقاً، لا نكرره
+        if (p.accountingPosted) return alert("هذا السند مرحّل مسبقًا ✅");
+
+        await postVendorPaymentEntry({ ...p, id: p.id });
+
+        await updateDoc(
+          doc(db, "artifacts", appId, "public", "data", "vendor_payments", p.id),
+          {
+            accountingPosted: true,
+            accountingPostedAt: Date.now(),
+          }
+        );
+
+        alert("تم ترحيل سند الصرف ✅");
+      } catch (err) {
+        console.error(err);
+        alert("فشل الترحيل: " + (err?.message || String(err)));
+      }
+    }}
+    className="px-4 py-2 rounded-xl bg-slate-950 text-white font-black"
+  >
+    ترحيل
+  </button>
+
+  {p.accountingPosted && (
+    <div className="text-xs font-black text-emerald-700 mt-2">✅ مرحّل</div>
+  )}
+</td>
+
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </div>
+)}
+
+
+
+{adminPage === "balanceSheet" && (
+  <div className="space-y-6">
+    <h2 className="text-xl font-black">📊 الميزانية العمومية</h2>
+
+    <div className="grid md:grid-cols-2 gap-6">
+      {/* الأصول */}
+      <div className="bg-white p-4 rounded-2xl border">
+        <div className="font-black mb-3">الأصول</div>
+        {assets.map((a) => (
+          <div key={a.id} className="flex justify-between py-1 font-bold">
+            <span>{a.name}</span>
+            <span dir="ltr">
+              {(balances[a.id] || 0).toFixed(2)}
+            </span>
+          </div>
+        ))}
+        <div className="border-t mt-2 pt-2 flex justify-between font-black">
+          <span>إجمالي الأصول</span>
+          <span dir="ltr">{totalAssets.toFixed(2)}</span>
+        </div>
+      </div>
+
+      {/* الخصوم وحقوق الملكية */}
+      <div className="bg-white p-4 rounded-2xl border">
+        <div className="font-black mb-3">الخصوم</div>
+        {liabilities.map((l) => (
+          <div key={l.id} className="flex justify-between py-1 font-bold">
+            <span>{l.name}</span>
+            <span dir="ltr">
+              {Math.abs(balances[l.id] || 0).toFixed(2)}
+            </span>
+          </div>
+        ))}
+
+        <div className="flex justify-between py-2 font-bold">
+          <span>حقوق الملكية</span>
+          <span dir="ltr">{equity.toFixed(2)}</span>
+        </div>
+
+        <div className="border-t mt-2 pt-2 flex justify-between font-black">
+          <span>إجمالي الخصوم + حقوق الملكية</span>
+          <span dir="ltr">{(totalLiabilities + equity).toFixed(2)}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+)}
+
+
+
+{adminPage === "cashFlow" && (
+  <div className="space-y-6">
+    <h2 className="text-xl font-black">💧 قائمة التدفقات النقدية</h2>
+
+    <div className="grid md:grid-cols-3 gap-6">
+      <div className="bg-white p-4 rounded-2xl border">
+        <div className="font-black mb-2">المتحصلات النقدية</div>
+        <div className="text-2xl font-black" dir="ltr">
+          {cashFlow.inflow.toFixed(2)}
+        </div>
+      </div>
+
+      <div className="bg-white p-4 rounded-2xl border">
+        <div className="font-black mb-2">المدفوعات النقدية</div>
+        <div className="text-2xl font-black" dir="ltr">
+          {cashFlow.outflow.toFixed(2)}
+        </div>
+      </div>
+
+      <div className="bg-white p-4 rounded-2xl border">
+        <div className="font-black mb-2">صافي التدفق النقدي</div>
+        <div
+          className={`text-2xl font-black ${
+            cashFlow.net >= 0 ? "text-emerald-600" : "text-red-600"
+          }`}
+          dir="ltr"
+        >
+          {cashFlow.net.toFixed(2)}
+        </div>
+      </div>
+    </div>
+  </div>
+)}
+
+
+
+
+{adminPage === "customer_ledger" && (
+  <CustomerLedger
+    customers={customers}
+    invoices={invoices}
+    selectedCustomerId={selectedCustomerId}
+    setSelectedCustomerId={setSelectedCustomerId}
+    CURRENCY={CURRENCY}
+    receipts={receipts}
+
+  />
+)}
+
+
+
+{adminPage === "receipts" && (
+  <ReceiptsPage
+    customers={customers}
+    receipts={receipts}
+    appId={appId}
+    db={db}
+    CURRENCY={CURRENCY}
+    accSettings={accSettings}
+    createJournalEntry={createJournalEntry}
+    postReceiptEntry={postReceiptEntry}
+  />
+)}
+
+
+{adminPage === "settings" && (
+  <div className="space-y-6">
+    <div className="flex items-center justify-between">
+      <h2 className="text-xl font-black">⚙️ إعدادات المحاسبة</h2>
+
+      <button
+        onClick={saveAccSettings}
+        className="px-5 py-3 rounded-2xl bg-black text-white font-black"
+      >
+        حفظ
+      </button>
+    </div>
+
+    <div className="bg-white p-4 rounded-2xl border">
+      <div className="font-black mb-3">الحسابات الافتراضية</div>
+
+
+<div className="bg-white p-4 rounded-2xl border">
+  <div className="flex items-center justify-between mb-3">
+    <div className="font-black">شجرة الحسابات</div>
+
+    <button
+      onClick={async () => {
+        await addDoc(
+          collection(db, "artifacts", appId, "public", "data", "accounts"),
+          {
+            code: String(1000 + accounts.length + 1),
+            key: "",
+            nameAr: "",
+            nameEn: "",
+            nameTr: "",
+            type: "asset",
+            active: true,
+            createdAt: Date.now(),
+          }
+        );
+      }}
+      className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-black"
+    >
+      + حساب جديد
+    </button>
+  </div>
+
+  {accounts.length === 0 ? (
+    <div className="text-sm text-slate-500 font-bold">لا يوجد حسابات بعد.</div>
+  ) : (
+    <div className="overflow-auto">
+      <table className="w-full min-w-[900px]">
+        <thead>
+          <tr className="text-sm text-slate-500">
+            <th className="text-right p-2">الكود</th>
+            <th className="text-right p-2">المفتاح</th>
+            <th className="text-right p-2">الاسم (AR)</th>
+            <th className="text-right p-2">الاسم (EN)</th>
+            <th className="text-right p-2">النوع</th>
+            <th className="text-right p-2">إجراء</th>
+          </tr>
+        </thead>
+        <tbody>
+          {accounts.map((a) => (
+            <tr key={a.id} className="border-t">
+              <td className="p-2">
+                <input
+                  className="w-24 border rounded-lg px-2 py-1 font-bold"
+                  value={a.code || ""}
+                  onChange={(e) =>
+                    updateDoc(
+                      doc(db, "artifacts", appId, "public", "data", "accounts", a.id),
+                      { code: e.target.value }
+                    )
+                  }
+                  dir="ltr"
+                />
+              </td>
+
+              <td className="p-2">
+                <input
+                  className="w-40 border rounded-lg px-2 py-1 font-bold"
+                  value={a.key || ""}
+                  onChange={(e) =>
+                    updateDoc(
+                      doc(db, "artifacts", appId, "public", "data", "accounts", a.id),
+                      { key: e.target.value }
+                    )
+                  }
+                  dir="ltr"
+                />
+              </td>
+
+              <td className="p-2">
+                <input
+                  className="w-52 border rounded-lg px-2 py-1 font-bold"
+                  value={a.nameAr || ""}
+                  onChange={(e) =>
+                    updateDoc(
+                      doc(db, "artifacts", appId, "public", "data", "accounts", a.id),
+                      { nameAr: e.target.value }
+                    )
+                  }
+                />
+              </td>
+
+              <td className="p-2">
+                <input
+                  className="w-52 border rounded-lg px-2 py-1 font-bold"
+                  value={a.nameEn || ""}
+                  onChange={(e) =>
+                    updateDoc(
+                      doc(db, "artifacts", appId, "public", "data", "accounts", a.id),
+                      { nameEn: e.target.value }
+                    )
+                  }
+                  dir="ltr"
+                />
+              </td>
+
+              <td className="p-2">
+                <select
+                  className="border rounded-lg px-2 py-1 font-bold"
+                  value={a.type || "asset"}
+                  onChange={(e) =>
+                    updateDoc(
+                      doc(db, "artifacts", appId, "public", "data", "accounts", a.id),
+                      { type: e.target.value }
+                    )
+                  }
+                >
+                  <option value="asset">Asset</option>
+                  <option value="liability">Liability</option>
+                  <option value="equity">Equity</option>
+                  <option value="revenue">Revenue</option>
+                  <option value="expense">Expense</option>
+                </select>
+              </td>
+
+              <td className="p-2">
+                <button
+                  onClick={() =>
+                    deleteDoc(
+                      doc(db, "artifacts", appId, "public", "data", "accounts", a.id)
+                    )
+                  }
+                  className="px-3 py-2 rounded-xl bg-red-600 text-white font-black"
+                >
+                  حذف
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )}
+</div>
+
+
+      {["cash", "bank", "sales", "vatOutput", "ar", "ap"].map((k) => (
+        <div key={k} className="mb-3">
+          <div className="text-sm text-slate-500 font-bold">{k}</div>
+          <select
+  className="w-full border rounded-xl px-4 py-3 font-bold"
+  value={accSettings.accounts?.[k] || ""}
+  onChange={(e) =>
+    setAccSettings((p) => ({
+      ...p,
+      accounts: { ...(p.accounts || {}), [k]: e.target.value },
+    }))
+  }
+  dir="ltr"
+>
+  <option value="">-- اختر حساب --</option>
+
+  {accounts
+    .filter((a) => a.active !== false && a.key)
+    .map((a) => {
+      const label =
+        (lang === "ar" ? a.nameAr : lang === "tr" ? a.nameTr : a.nameEn) ||
+        a.nameAr ||
+        a.nameEn ||
+        a.key;
+
+      return (
+        <option key={a.id} value={a.key}>
+          {a.code ? `${a.code} - ` : ""}{label} ({a.key})
+        </option>
+      );
+    })}
+</select>
+
+        </div>
+      ))}
+    </div>
+  </div>
+)}
+
+
+
+
     </section>
   </div>
 </main>
@@ -4163,7 +6327,7 @@ const getPayLabel = (pm) => {
                     className="w-28 p-2 rounded-xl border text-center font-black"
                   />
                   <div className="text-xs font-bold text-slate-500">
-                    {invNewUnit === "g" ? "g" : invNewUnit === "ml" ? "ml" : "pcs"}
+                    {invNewUnit === "kg" ? invNewLinksInputUnit : invNewUnit === "liter" ? invNewLinksInputUnit : "pcs"}
                   </div>
                 </div>
               </div>
@@ -5399,7 +7563,7 @@ const cartTotalWithTax = cartSubtotal + cartTaxAmount;
     );
 
     await addDoc(
-      colRef("inventory"),
+      collection(db, "artifacts", appId, "public", "data", "orders"),
       {
         table,
         items,
